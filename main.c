@@ -26,6 +26,9 @@
 #define WEATHER_TIME_SCALE 1.6f
 #define WEATHER_UPDATE_HZ 24.0f
 #define CLOUD_LAYER_HEIGHT 0.030f
+#define ATMOSPHERE_SURFACE_MARGIN 0.20f
+#define ATMOSPHERE_DENSITY_FALLOFF 2.9f
+#define ATMOSPHERE_SCATTERING_STRENGTH 24.0f
 #define MAX_TILE_NEIGHBORS 8
 #define FLOW_ARROW_SEGMENTS 5
 
@@ -1665,6 +1668,99 @@ static float WeatherViewOverlayStrength(WeatherViewMode mode)
     }
 }
 
+static uint64_t HashInts3(int a, int b, int c)
+{
+    return ((uint64_t)(uint32_t)a << 32) ^ ((uint64_t)(uint32_t)b << 1) ^ (uint64_t)(uint32_t)c;
+}
+
+static float Hash2D01(int x, int y, int seed)
+{
+    uint32_t h = Hash64(HashInts3(x * 73856093, y * 19349663, seed * 83492791));
+    return (float)h / (float)UINT32_MAX;
+}
+
+static Vector3 SunLightDirection(void)
+{
+    return Vector3Normalize((Vector3){ -0.38f, 0.70f, 0.60f });
+}
+
+static float MaxSurfaceRadius(const Tile *tiles, int tileCount)
+{
+    float maxRadius = PLANET_RADIUS;
+    for (int i = 0; i < tileCount; i++) {
+        float centerRadius = Vector3Length(tiles[i].center);
+        if (centerRadius > maxRadius) maxRadius = centerRadius;
+        for (int j = 0; j < tiles[i].cornerCount; j++) {
+            float cornerRadius = Vector3Length(tiles[i].corners[j]);
+            if (cornerRadius > maxRadius) maxRadius = cornerRadius;
+        }
+    }
+    return maxRadius;
+}
+
+static Vector3 AtmosphereScatterCoefficients(float strength)
+{
+    float redWavelength = 700.0f;
+    float greenWavelength = 530.0f;
+    float blueWavelength = 440.0f;
+
+    return (Vector3){
+        powf(400.0f / redWavelength, 4.0f) * strength,
+        powf(400.0f / greenWavelength, 4.0f) * strength,
+        powf(400.0f / blueWavelength, 4.0f) * strength
+    };
+}
+
+static void DrawSunIndicator(Camera3D camera)
+{
+    Vector3 lightDir = SunLightDirection();
+    Vector3 sunWorld = Vector3Scale(lightDir, 120.0f);
+    Vector3 toSun = Vector3Normalize(Vector3Subtract(sunWorld, camera.position));
+    Vector3 cameraForward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    if (Vector3DotProduct(cameraForward, toSun) <= 0.0f) return;
+
+    Vector2 sunScreen = GetWorldToScreen(sunWorld, camera);
+    float radius = 18.0f;
+    DrawCircleV(sunScreen, radius * 4.6f, (Color){ 255, 210, 120, 18 });
+    DrawCircleV(sunScreen, radius * 3.1f, (Color){ 255, 220, 148, 34 });
+    DrawCircleV(sunScreen, radius * 2.0f, (Color){ 255, 234, 180, 62 });
+    DrawCircleV(sunScreen, radius * 1.1f, (Color){ 255, 244, 208, 246 });
+}
+
+static void DrawSpaceBackground(int screenWidth, int screenHeight, float clock)
+{
+    DrawRectangleGradientV(0, 0, screenWidth, screenHeight, (Color){ 5, 8, 18, 255 }, (Color){ 1, 2, 7, 255 });
+
+    int cellSize = 32;
+    int cols = screenWidth / cellSize + 2;
+    int rows = screenHeight / cellSize + 2;
+    for (int y = 0; y < rows; y++) {
+        for (int x = 0; x < cols; x++) {
+            float starChance = Hash2D01(x, y, 17);
+            if (starChance < 0.915f) continue;
+
+            float px = ((float)x + Hash2D01(x, y, 29)) * (float)cellSize;
+            float py = ((float)y + Hash2D01(x, y, 43)) * (float)cellSize;
+            float phase = Hash2D01(x, y, 61) * 2.0f * PI;
+            float twinkle = 0.78f + 0.22f * sinf(clock * (0.7f + Hash2D01(x, y, 73) * 1.3f) + phase);
+            float hueMix = Hash2D01(x, y, 97);
+            Color cool = (Color){ 156, 194, 255, 255 };
+            Color warm = (Color){ 255, 232, 198, 255 };
+            Color star = LerpColor(cool, warm, hueMix * 0.42f);
+            star.a = (unsigned char)(ClampFloat(190.0f + starChance * 75.0f * twinkle, 0.0f, 255.0f));
+
+            int size = starChance > 0.992f ? 3 : (starChance > 0.970f ? 2 : 1);
+            DrawRectangle((int)px, (int)py, size, size, star);
+            if (size > 1) {
+                Color glow = star;
+                glow.a = (unsigned char)(star.a * 0.45f);
+                DrawRectangle((int)px - 2, (int)py, size + 4, 1, glow);
+                DrawRectangle((int)px, (int)py - 2, 1, size + 4, glow);
+            }
+        }
+    }
+}
+
 static void DrawPlanetTiles(
     const Tile *tiles,
     const WeatherCell *weather,
@@ -1806,6 +1902,7 @@ static void DrawSelectedTileInfo(
 
 static void DrawViewThemeInfo(
     bool showPlateView,
+    bool atmosphereEnabled,
     bool weatherEnabled,
     WeatherViewMode weatherView,
     bool tectonicsPaused
@@ -1814,8 +1911,10 @@ static void DrawViewThemeInfo(
     const char *viewLine = showPlateView ? "View: Plates" : (weatherEnabled ? "View: Weather" : "View: Terrain");
     char modeLine[96];
     snprintf(modeLine, sizeof(modeLine), "Weather Mode: %s", WeatherViewName(weatherView));
-    char stateLine[96];
-    snprintf(stateLine, sizeof(stateLine), "Weather: %s  Tectonics: %s", weatherEnabled ? "On" : "Off", tectonicsPaused ? "Paused" : "Running");
+    char stateLine[120];
+    snprintf(stateLine, sizeof(stateLine), "Weather: %s  Atmosphere: %s  Tectonics: %s", weatherEnabled ? "On" : "Off", atmosphereEnabled ? "On" : "Off", tectonicsPaused ? "Paused" : "Running");
+    char controlsLine[96];
+    snprintf(controlsLine, sizeof(controlsLine), "A Atmosphere  C Plates  W Weather");
 
     int font = 18;
     int pad = 12;
@@ -1823,11 +1922,13 @@ static void DrawViewThemeInfo(
     int w1 = MeasureText(viewLine, font);
     int w2 = MeasureText(modeLine, font);
     int w3 = MeasureText(stateLine, font);
+    int w4 = MeasureText(controlsLine, font);
     int width = w1;
     if (w2 > width) width = w2;
     if (w3 > width) width = w3;
+    if (w4 > width) width = w4;
     width += pad * 2;
-    int height = pad * 2 + font * 3 + gap * 2;
+    int height = pad * 2 + font * 4 + gap * 3;
 
     int x = GetScreenWidth() - width - 14;
     int y = 14;
@@ -1836,6 +1937,7 @@ static void DrawViewThemeInfo(
     DrawText(viewLine, x + pad, y + pad, font, (Color){ 244, 248, 255, 255 });
     DrawText(modeLine, x + pad, y + pad + font + gap, font, (Color){ 210, 220, 236, 255 });
     DrawText(stateLine, x + pad, y + pad + (font + gap) * 2, font, (Color){ 210, 220, 236, 255 });
+    DrawText(controlsLine, x + pad, y + pad + (font + gap) * 3, font, (Color){ 182, 198, 218, 255 });
 }
 
 static void DrawWeatherClouds(
@@ -2035,6 +2137,37 @@ int main(void)
     InitWindow(1280, 800, "Planet");
     SetTargetFPS(60);
 
+    Shader atmosphereShader = LoadShader("shaders/atmosphere.vs", "shaders/atmosphere.fs");
+    int atmosphereScreenSizeLoc = GetShaderLocation(atmosphereShader, "screenSize");
+    int atmosphereCameraPosLoc = GetShaderLocation(atmosphereShader, "cameraPos");
+    int atmosphereCameraForwardLoc = GetShaderLocation(atmosphereShader, "cameraForward");
+    int atmosphereCameraRightLoc = GetShaderLocation(atmosphereShader, "cameraRight");
+    int atmosphereCameraUpLoc = GetShaderLocation(atmosphereShader, "cameraUp");
+    int atmosphereCameraFovYLoc = GetShaderLocation(atmosphereShader, "cameraFovY");
+    int atmosphereAspectRatioLoc = GetShaderLocation(atmosphereShader, "aspectRatio");
+    int atmospherePlanetRadiusLoc = GetShaderLocation(atmosphereShader, "planetRadius");
+    int atmosphereAtmosphereRadiusLoc = GetShaderLocation(atmosphereShader, "atmosphereRadius");
+    int atmosphereLightDirLoc = GetShaderLocation(atmosphereShader, "lightDir");
+    int atmosphereScatteringCoefficientsLoc = GetShaderLocation(atmosphereShader, "scatteringCoefficients");
+    int atmosphereDensityFalloffLoc = GetShaderLocation(atmosphereShader, "densityFalloff");
+    int atmosphereScatteringStrengthLoc = GetShaderLocation(atmosphereShader, "scatteringStrength");
+
+    Vector3 atmosphereScatterCoefficients = AtmosphereScatterCoefficients(ATMOSPHERE_SCATTERING_STRENGTH);
+    Vector3 sunLightDirection = SunLightDirection();
+    float atmospherePlanetRadius = PLANET_RADIUS;
+    float atmosphereOuterRadius = PLANET_RADIUS + ATMOSPHERE_SURFACE_MARGIN;
+    float atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF;
+    float atmosphereScatteringStrength = 1.0f;
+
+    SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(atmosphereShader, atmosphereLightDirLoc, &sunLightDirection.x, SHADER_UNIFORM_VEC3);
+    SetShaderValue(atmosphereShader, atmosphereScatteringCoefficientsLoc, &atmosphereScatterCoefficients.x, SHADER_UNIFORM_VEC3);
+    SetShaderValue(atmosphereShader, atmosphereDensityFalloffLoc, &atmosphereDensityFalloff, SHADER_UNIFORM_FLOAT);
+    SetShaderValue(atmosphereShader, atmosphereScatteringStrengthLoc, &atmosphereScatteringStrength, SHADER_UNIFORM_FLOAT);
+
+    RenderTexture2D sceneTexture = LoadRenderTexture(GetScreenWidth(), GetScreenHeight());
+
     VertexBuffer vertices = { 0 };
     TriangleBuffer triangles = { 0 };
     BuildIcosphere(&vertices, &triangles, SUBDIVISIONS, PLANET_RADIUS);
@@ -2053,6 +2186,8 @@ int main(void)
     WeatherCell *weatherB = (WeatherCell *)calloc((size_t)tileCount, sizeof(WeatherCell));
     InitializeWeather(weatherA, tiles, tileCount);
     memcpy(weatherB, weatherA, sizeof(WeatherCell) * (size_t)tileCount);
+    atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
+    SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
 
     OrbitCamera orbit = {
         .yaw = 0.8f,
@@ -2064,6 +2199,7 @@ int main(void)
         .target = { 0.0f, 0.0f, 0.0f }
     };
     Camera3D camera = { 0 };
+    bool atmosphereEnabled = true;
     bool showPlateView = false;
     bool tectonicsPaused = false;
     bool weatherEnabled = true;
@@ -2077,6 +2213,7 @@ int main(void)
 
     while (!WindowShouldClose()) {
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) clickStart = GetMousePosition();
+        if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
         if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
         if (IsKeyPressed(KEY_SPACE)) tectonicsPaused = !tectonicsPaused;
         if (IsKeyPressed(KEY_W)) weatherEnabled = !weatherEnabled;
@@ -2100,6 +2237,8 @@ int main(void)
             if (tectonicRebuildTimer >= tectonicRebuildStep) {
                 tectonicRebuildTimer -= tectonicRebuildStep;
                 UpdatePlanetTiles(tiles, tileCount, triangleDirections, triangleSurfacePoints, triangles.count, plates, plateCount, PLANET_RADIUS);
+                atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
+                SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
             }
         }
 
@@ -2116,6 +2255,14 @@ int main(void)
         }
 
         UpdateOrbitCamera(&orbit, &camera);
+        if (IsWindowResized()) {
+            int width = GetScreenWidth();
+            int height = GetScreenHeight();
+            if (width > 0 && height > 0) {
+                UnloadRenderTexture(sceneTexture);
+                sceneTexture = LoadRenderTexture(width, height);
+            }
+        }
         if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             Vector2 end = GetMousePosition();
             float dx = end.x - clickStart.x;
@@ -2125,18 +2272,49 @@ int main(void)
             }
         }
 
-        BeginDrawing();
-        ClearBackground((Color){ 8, 10, 16, 255 });
-
+        BeginTextureMode(sceneTexture);
+        ClearBackground((Color){ 0, 0, 0, 0 });
         BeginMode3D(camera);
         DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile);
         if (!showPlateView && weatherEnabled) DrawWeatherClouds(tiles, weatherA, tileCount, weatherView);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_WIND) DrawWindVectors(tiles, weatherA, tileCount);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_CURRENT) DrawCurrentVectors(tiles, weatherA, tileCount);
         EndMode3D();
+        EndTextureMode();
+
+        int screenWidth = GetScreenWidth();
+        int screenHeight = GetScreenHeight();
+        Vector2 screenSize = { (float)screenWidth, (float)screenHeight };
+        Vector3 cameraForward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+        Vector3 cameraRight = Vector3Normalize(Vector3CrossProduct(cameraForward, camera.up));
+        Vector3 cameraTrueUp = Vector3Normalize(Vector3CrossProduct(cameraRight, cameraForward));
+        float cameraFovY = camera.fovy;
+        float aspectRatio = (float)screenWidth / (float)screenHeight;
+
+        SetShaderValue(atmosphereShader, atmosphereScreenSizeLoc, &screenSize.x, SHADER_UNIFORM_VEC2);
+        SetShaderValue(atmosphereShader, atmosphereCameraPosLoc, &camera.position.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(atmosphereShader, atmosphereCameraForwardLoc, &cameraForward.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(atmosphereShader, atmosphereCameraRightLoc, &cameraRight.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(atmosphereShader, atmosphereCameraUpLoc, &cameraTrueUp.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(atmosphereShader, atmosphereCameraFovYLoc, &cameraFovY, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(atmosphereShader, atmosphereAspectRatioLoc, &aspectRatio, SHADER_UNIFORM_FLOAT);
+
+        Rectangle source = { 0.0f, 0.0f, (float)sceneTexture.texture.width, -(float)sceneTexture.texture.height };
+        Rectangle destination = { 0.0f, 0.0f, (float)screenWidth, (float)screenHeight };
+
+        BeginDrawing();
+        DrawSpaceBackground(screenWidth, screenHeight, (float)GetTime());
+        DrawSunIndicator(camera);
+        if (atmosphereEnabled) {
+            BeginShaderMode(atmosphereShader);
+            DrawTexturePro(sceneTexture.texture, source, destination, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+            EndShaderMode();
+        } else {
+            DrawTexturePro(sceneTexture.texture, source, destination, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
+        }
 
         DrawSelectedTileInfo(tiles, plates, weatherA, tileCount, selectedTile, tectonicsPaused, weatherEnabled, weatherView);
-        DrawViewThemeInfo(showPlateView, weatherEnabled, weatherView, tectonicsPaused);
+        DrawViewThemeInfo(showPlateView, atmosphereEnabled, weatherEnabled, weatherView, tectonicsPaused);
 
         EndDrawing();
     }
@@ -2149,6 +2327,8 @@ int main(void)
     free(triangleDirections);
     free(triangles.items);
     free(vertices.items);
+    UnloadRenderTexture(sceneTexture);
+    UnloadShader(atmosphereShader);
 
     CloseWindow();
     return 0;
