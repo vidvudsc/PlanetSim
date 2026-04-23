@@ -14,7 +14,9 @@ Weather is physically motivated: trade winds and westerlies drive atmospheric ci
 - **Atmospheric circulation** — trade winds, westerlies, polar highs, ITCZ, and storm tracks
 - **Terrain-driven weather** — orographic lift, rain shadows, valley channeling, cold pooling
 - **Ocean currents** — gyre patterns, wind-driven drift, Coriolis deflection
-- **11 visualization modes** — temperature, pressure, wind, humidity, clouds, rain, snow, vorticity, and more
+- **Sun-driven climate** — day/night heating, axial tilt, seasons, and ocean heat transport
+- **12 visualization modes** — temperature, pressure, wind, humidity, clouds, rain, snow, vorticity, ocean temperature, and more
+- **Live control panel** — adjust weather speed, solar forcing, tilt, atmosphere tuning, and view modes in real time
 
 ---
 
@@ -45,4 +47,6 @@ make
 
 - **Left drag** — rotate globe
 - **Scroll** — zoom
-- **Keys** — switch visualization modes
+- **F1** — show or hide the control panel
+- **A / C / W / Space** — atmosphere, plate view, weather, tectonics pause
+- **Tab / 1-0 / E / R** — cycle or jump to weather visualization modes

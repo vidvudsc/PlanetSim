@@ -132,12 +132,50 @@ typedef struct WeatherCell {
     float elevation;
     float ocean;
     float surfaceTemperature;
+    float oceanTemperature;
     float soilMoisture;
     float cloudWater;
     float recentRain;
     float rainShadow;
     float orographicLift;
 } WeatherCell;
+
+typedef struct ClimateSettings {
+    bool panelOpen;
+    bool autoAdvanceTime;
+    bool dayNightEnabled;
+    bool seasonsEnabled;
+    bool showSunOrbit;
+    float dayPhase;
+    float yearPhase;
+    float daySpeed;
+    float yearSpeed;
+    float axialTiltDegrees;
+    float solarIntensity;
+    float weatherTimeScale;
+    float temperatureContrast;
+    float atmosphereDensityFalloff;
+    float atmosphereScatteringScale;
+    float panelScroll;
+    float panelContentHeight;
+} ClimateSettings;
+
+typedef struct SolarState {
+    Vector3 northPole;
+    Vector3 orbitRight;
+    Vector3 orbitForward;
+    Vector3 lightDir;
+    float declination;
+} SolarState;
+
+typedef struct PanelLayout {
+    Rectangle bounds;
+    Rectangle clipRect;
+    float cursorY;
+    float contentX;
+    float contentWidth;
+    float scrollY;
+} PanelLayout;
 
 typedef enum WeatherViewMode {
     WEATHER_VIEW_TEMPERATURE = 0,
@@ -151,14 +189,16 @@ typedef enum WeatherViewMode {
     WEATHER_VIEW_STORM,
     WEATHER_VIEW_EVAPORATION,
     WEATHER_VIEW_SNOW,
+    WEATHER_VIEW_OCEAN_TEMP,
     WEATHER_VIEW_COUNT
 } WeatherViewMode;
 
 static float SphericalNoise3(Vector3 unitDirection, float scale, Vector3 offset, int octaves, float lacunarity, float gain);
-static float WarpedClimateLatitude(Vector3 unitDirection, float strength);
+static float WarpedClimateLatitudeFromAxis(Vector3 unitDirection, Vector3 climateNorth, float equatorShift, float strength);
 static Vector3 TangentEast(Vector3 normal);
-static Vector3 TangentNorth(Vector3 normal);
-static Vector3 ClimateEddyFlow(Vector3 normal, float scale, Vector3 offset, float strength);
+static Vector3 TangentEastFromAxis(Vector3 normal, Vector3 climateNorth);
+static Vector3 TangentNorthFromAxis(Vector3 normal, Vector3 climateNorth);
+static Vector3 ClimateEddyFlowFromAxis(Vector3 normal, Vector3 climateNorth, float scale, Vector3 offset, float strength);
 
 static float ClampFloat(float value, float minValue, float maxValue)
 {
@@ -176,6 +216,71 @@ static float SmoothStep01(float x)
 {
     x = ClampFloat(x, 0.0f, 1.0f);
     return x * x * (3.0f - 2.0f * x);
+}
+
+static float Wrap01(float value)
+{
+    value = fmodf(value, 1.0f);
+    if (value < 0.0f) value += 1.0f;
+    return value;
+}
+
+static Vector3 BuildClimateNorthPole(float axialTiltDegrees)
+{
+    float tilt = axialTiltDegrees * DEG2RAD;
+    return Vector3Normalize((Vector3){ sinf(tilt), cosf(tilt), 0.0f });
+}
+
+static SolarState BuildSolarState(const ClimateSettings *climate)
+{
+    SolarState solar = { 0 };
+    solar.northPole = BuildClimateNorthPole(climate->axialTiltDegrees);
+
+    Vector3 orbitRight = Vector3CrossProduct((Vector3){ 0.0f, 0.0f, 1.0f }, solar.northPole);
+    if (Vector3LengthSqr(orbitRight) < 0.000001f) orbitRight = Vector3CrossProduct((Vector3){ 1.0f, 0.0f, 0.0f }, solar.northPole);
+    orbitRight = Vector3Normalize(orbitRight);
+    Vector3 orbitForward = Vector3Normalize(Vector3CrossProduct(solar.northPole, orbitRight));
+    solar.orbitRight = orbitRight;
+    solar.orbitForward = orbitForward;
+
+    float dayAngle = climate->dayPhase * 2.0f * PI;
+    float yearAngle = climate->yearPhase * 2.0f * PI;
+    solar.declination = climate->seasonsEnabled ? sinf(yearAngle) * climate->axialTiltDegrees * DEG2RAD : 0.0f;
+
+    Vector3 equatorialSun = Vector3Add(
+        Vector3Scale(solar.orbitRight, cosf(dayAngle)),
+        Vector3Scale(solar.orbitForward, sinf(dayAngle))
+    );
+    solar.lightDir = Vector3Normalize(Vector3Add(
+        Vector3Scale(equatorialSun, cosf(solar.declination)),
+        Vector3Scale(solar.northPole, sinf(solar.declination))
+    ));
+    return solar;
+}
+
+static float SolarFacingAmount(Vector3 normal, Vector3 lightDir)
+{
+    return ClampFloat(Vector3DotProduct(normal, lightDir), -1.0f, 1.0f);
+}
+
+static float ClimateEquatorShift(const SolarState *solar, const ClimateSettings *climate)
+{
+    if (!climate->seasonsEnabled || climate->axialTiltDegrees <= 0.0f) return 0.0f;
+    return ClampFloat(sinf(solar->declination) * 0.42f, -0.34f, 0.34f);
+}
+
+static float ClimateInsolation(Vector3 normal, const SolarState *solar, const ClimateSettings *climate)
+{
+    float equatorShift = ClimateEquatorShift(solar, climate);
+    float climateLat = WarpedClimateLatitudeFromAxis(normal, solar->northPole, equatorShift, 0.145f);
+    float baseHeat = 1.0f - climateLat * climateLat;
+    float signedLatitude = Vector3DotProduct(normal, solar->northPole);
+    float seasonBias = climate->seasonsEnabled ? signedLatitude * sinf(solar->declination) * 0.34f : 0.0f;
+    float sunDot = SolarFacingAmount(normal, solar->lightDir);
+    float daylightBoost = climate->dayNightEnabled ? fmaxf(0.0f, sunDot) * 0.26f : 0.12f;
+    float nightsideCooling = climate->dayNightEnabled ? fmaxf(0.0f, -sunDot) * 0.08f : 0.0f;
+    float insolation = ClampFloat(baseHeat + seasonBias + daylightBoost - nightsideCooling, 0.0f, 1.0f);
+    return ClampFloat(insolation * climate->solarIntensity, 0.0f, 1.0f);
 }
 
 static float DisplayElevation(float elevation)
@@ -442,25 +547,25 @@ static float SmoothLerpFactor(float speed, float deltaTime)
     return 1.0f - expf(-speed * deltaTime);
 }
 
-static void UpdateOrbitCamera(OrbitCamera *orbit, Camera3D *camera)
+static void UpdateOrbitCamera(OrbitCamera *orbit, Camera3D *camera, bool allowInput)
 {
     float dt = GetFrameTime();
     if (dt > 0.1f) dt = 0.1f;
     Vector2 mouseDelta = GetMouseDelta();
 
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+    if (allowInput && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
         orbit->yawTarget += mouseDelta.x * 0.0075f;
         orbit->pitchTarget -= mouseDelta.y * 0.0075f;
     }
 
-    if (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT)) {
+    if (allowInput && (IsMouseButtonDown(MOUSE_BUTTON_MIDDLE) || IsMouseButtonDown(MOUSE_BUTTON_RIGHT))) {
         orbit->yawTarget += mouseDelta.x * 0.0075f;
         orbit->pitchTarget -= mouseDelta.y * 0.0075f;
     }
     orbit->pitchTarget = ClampFloat(orbit->pitchTarget, -1.46f, 1.46f);
 
     float wheel = GetMouseWheelMove();
-    if (wheel != 0.0f) {
+    if (allowInput && wheel != 0.0f) {
         orbit->distanceTarget *= expf(-wheel * 0.115f);
         orbit->distanceTarget = ClampFloat(orbit->distanceTarget, PLANET_RADIUS * 1.42f, 36.0f);
     }
@@ -686,17 +791,17 @@ static float GaussianBand(float x, float center, float width)
     return expf(-d * d);
 }
 
-static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count)
+static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count, const ClimateSettings *climate, const SolarState *solar)
 {
     RefreshWeatherSurface(cells, tiles, count);
     for (int i = 0; i < count; i++) {
-        float latAbs = fabsf(cells[i].normal.y);
-        float climateLat = WarpedClimateLatitude(cells[i].normal, 0.145f);
+        float latAbs = fabsf(Vector3DotProduct(cells[i].normal, solar->northPole));
+        float climateLat = WarpedClimateLatitudeFromAxis(cells[i].normal, solar->northPole, ClimateEquatorShift(solar, climate), 0.145f);
         float planetaryWave = SphericalNoise3(cells[i].normal, 1.65f, (Vector3){ 23.7f, -18.2f, 9.4f }, 3, 1.92f, 0.54f);
         float moistureWave = SphericalNoise3(cells[i].normal, 4.35f, (Vector3){ -42.1f, 7.8f, 31.6f }, 3, 2.07f, 0.52f);
         float eddyWave = SphericalNoise3(cells[i].normal, 7.8f, (Vector3){ 15.2f, 51.4f, -22.7f }, 2, 2.16f, 0.48f);
         float pressureSeed = SphericalNoise3(cells[i].normal, 2.85f, (Vector3){ 88.1f, -34.6f, 12.5f }, 3, 2.04f, 0.52f);
-        float equatorHeat = ClampFloat(1.0f - climateLat * climateLat + (planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
+        float equatorHeat = ClampFloat(ClimateInsolation(cells[i].normal, solar, climate) + (planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
         float westerly = GaussianBand(climateLat, 0.45f, 0.17f);
         float trade = GaussianBand(climateLat, 0.20f, 0.14f);
         float polar = GaussianBand(climateLat, 0.78f, 0.11f);
@@ -717,18 +822,19 @@ static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count)
         cells[i].snow = ClampFloat((GaussianBand(latAbs, 0.92f, 0.22f) + mountainSnow * 0.75f) * (1.0f - cells[i].ocean * 0.55f) * SmoothStep01((0.42f - cells[i].temperature) / 0.30f), 0.0f, 1.0f);
         cells[i].storm = 0.0f;
         cells[i].surfaceTemperature = cells[i].temperature;
+        cells[i].oceanTemperature = cells[i].temperature;
         cells[i].soilMoisture = ClampFloat((1.0f - cells[i].ocean) * (0.10f + cells[i].humidity * 0.32f + stormTrack * 0.10f - subtropicalHigh * 0.08f - fmaxf(cells[i].elevation, 0.0f) * 0.08f), 0.0f, 1.0f);
         cells[i].cloudWater = cells[i].cloud * 0.35f;
         cells[i].recentRain = 0.0f;
         cells[i].rainShadow = 0.0f;
         cells[i].orographicLift = 0.0f;
 
-        Vector3 east = TangentEast(cells[i].normal);
-        Vector3 north = TangentNorth(cells[i].normal);
+        Vector3 east = TangentEastFromAxis(cells[i].normal, solar->northPole);
+        Vector3 north = TangentNorthFromAxis(cells[i].normal, solar->northPole);
 
         float zonal = (0.088f * westerly - 0.066f * trade - 0.035f * polar) * LerpFloat(0.64f, 1.10f, planetaryWave) * 0.62f;
         float meridional = ((planetaryWave - 0.5f) * 0.052f + (eddyWave - 0.5f) * 0.034f) * (1.0f - latAbs * 0.35f);
-        Vector3 windEddy = ClimateEddyFlow(cells[i].normal, 3.4f, (Vector3){ -8.7f, 61.4f, 25.1f }, 0.010f);
+        Vector3 windEddy = ClimateEddyFlowFromAxis(cells[i].normal, solar->northPole, 3.4f, (Vector3){ -8.7f, 61.4f, 25.1f }, 0.010f);
         cells[i].wind = Vector3Add(
             Vector3Add(Vector3Add(Vector3Scale(east, zonal), Vector3Scale(north, meridional)), windEddy),
             Vector3Scale(RandomTangentVector(cells[i].normal), RandomRange(-0.006f, 0.006f))
@@ -736,7 +842,7 @@ static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count)
 
         // Initial ocean gyres use latitude bands, with planetary waves to avoid perfectly parallel rings.
         float oceanJet = (0.052f * westerly - 0.045f * trade - 0.020f * polar) * cells[i].ocean * LerpFloat(0.82f, 1.06f, planetaryWave) * 0.32f;
-        Vector3 currentEddy = ClimateEddyFlow(cells[i].normal, 2.6f, (Vector3){ 37.8f, -14.2f, 73.6f }, 0.015f * cells[i].ocean);
+        Vector3 currentEddy = ClimateEddyFlowFromAxis(cells[i].normal, solar->northPole, 2.6f, (Vector3){ 37.8f, -14.2f, 73.6f }, 0.015f * cells[i].ocean);
         cells[i].current = Vector3Add(
             Vector3Add(Vector3Add(Vector3Scale(east, oceanJet), Vector3Scale(north, meridional * cells[i].ocean * 0.30f)), currentEddy),
             Vector3Scale(RandomTangentVector(cells[i].normal), RandomRange(-0.003f, 0.003f) * cells[i].ocean)
@@ -749,7 +855,9 @@ static void StepWeatherSimulation(
     const WeatherCell *src,
     WeatherCell *dst,
     int count,
-    float dt
+    float dt,
+    const ClimateSettings *climate,
+    const SolarState *solar
 )
 {
     for (int i = 0; i < count; i++) {
@@ -764,6 +872,8 @@ static void StepWeatherSimulation(
         float pressAvg = c->pressure;
         Vector3 windAvg = c->wind;
         Vector3 currentAvg = c->current;
+        float oceanTempAvg = c->oceanTemperature;
+        float oceanTempWeight = 1.0f;
         float scalarWeight = 1.0f;
         Vector3 pressureGradient = { 0 };
         Vector3 terrainGradient = { 0 };
@@ -796,6 +906,11 @@ static void StepWeatherSimulation(
             currentAvg = Vector3Add(currentAvg, Vector3Scale(k->current, upwindWeight));
             scalarWeight += upwindWeight;
             soilMoistureAvg += k->soilMoisture;
+
+            float currentFlow = Vector3DotProduct(c->current, toNb);
+            float oceanWeight = 1.0f + fmaxf(0.0f, -currentFlow * 4.0f);
+            oceanTempAvg += k->oceanTemperature * oceanWeight;
+            oceanTempWeight += oceanWeight;
 
             pressAvg += k->pressure;
             pressureGradient = Vector3Add(pressureGradient, Vector3Scale(toNb, (k->pressure - c->pressure)));
@@ -832,14 +947,16 @@ static void StepWeatherSimulation(
             coastalContrast = ClampFloat(coastalContrast / (float)node->neighborCount, 0.0f, 1.0f);
         }
         upwindOcean = ClampFloat(upwindOcean / upwindOceanWeight, 0.0f, 1.0f);
+        oceanTempAvg /= oceanTempWeight;
         float terrainSlope = ClampFloat(Vector3Length(terrainGradient), 0.0f, 1.0f);
 
-        float latAbs = fabsf(c->normal.y);
-        float climateLat = WarpedClimateLatitude(c->normal, 0.145f);
+        float latAbs = fabsf(Vector3DotProduct(c->normal, solar->northPole));
+        float equatorShift = ClimateEquatorShift(solar, climate);
+        float climateLat = WarpedClimateLatitudeFromAxis(c->normal, solar->northPole, equatorShift, 0.145f);
         float planetaryWave = SphericalNoise3(c->normal, 1.65f, (Vector3){ 23.7f, -18.2f, 9.4f }, 3, 1.92f, 0.54f);
         float moistureWave = SphericalNoise3(c->normal, 4.35f, (Vector3){ -42.1f, 7.8f, 31.6f }, 3, 2.07f, 0.52f);
         float eddyWave = SphericalNoise3(c->normal, 7.8f, (Vector3){ 15.2f, 51.4f, -22.7f }, 2, 2.16f, 0.48f);
-        float equatorHeat = ClampFloat(1.0f - climateLat * climateLat + (planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
+        float equatorHeat = ClampFloat(ClimateInsolation(c->normal, solar, climate) + (planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
         float itcz = GaussianBand(climateLat, 0.04f, 0.17f) * LerpFloat(0.84f, 1.12f, moistureWave);
         float subtropicalHigh = GaussianBand(climateLat, 0.31f, 0.13f);
         float stormTrack = GaussianBand(climateLat, 0.55f, 0.22f) * LerpFloat(0.86f, 1.08f, planetaryWave);
@@ -850,7 +967,7 @@ static void StepWeatherSimulation(
         float land = 1.0f - c->ocean;
         float albedo = ClampFloat(0.07f * c->ocean + 0.23f * land + 0.34f * c->snow + 0.12f * c->cloud, 0.0f, 0.75f);
         float lapseCooling = fmaxf(c->elevation, 0.0f) * 0.38f + fmaxf(c->elevation - 0.55f, 0.0f) * 0.22f + fmaxf(-c->elevation, 0.0f) * 0.025f;
-        float landHeating = land * (equatorHeat - 0.45f) * 0.090f;
+        float landHeating = land * (equatorHeat - 0.45f) * (0.090f * climate->temperatureContrast);
         float marineModeration = c->ocean * (0.50f - c->temperature) * 0.055f;
         float terrainCooling = fmaxf(elevationAvg, 0.0f) * 0.070f;
         float temperatureTarget = ClampFloat(0.08f + 0.88f * powf(equatorHeat, 0.86f) + landHeating + marineModeration - lapseCooling - terrainCooling - albedo * 0.16f + c->humidity * 0.015f, 0.0f, 1.0f);
@@ -866,8 +983,8 @@ static void StepWeatherSimulation(
         pressure -= convergence * 0.045f * dt;
         pressure = ClampFloat(pressure, 0.18f, 0.88f);
 
-        Vector3 east = TangentEast(c->normal);
-        Vector3 north = TangentNorth(c->normal);
+        Vector3 east = TangentEastFromAxis(c->normal, solar->northPole);
+        Vector3 north = TangentNorthFromAxis(c->normal, solar->northPole);
         float northLen = Vector3Length(north);
 
         float westerly = GaussianBand(climateLat, 0.45f, 0.17f);
@@ -922,8 +1039,12 @@ static void StepWeatherSimulation(
 
         float polewardCurrent = 0.0f;
         if (northLen > 0.000001f) {
-            polewardCurrent = Vector3DotProduct(current, north) * ((c->normal.y >= 0.0f) ? 1.0f : -1.0f);
+            polewardCurrent = Vector3DotProduct(current, north) * ((Vector3DotProduct(c->normal, solar->northPole) >= 0.0f) ? 1.0f : -1.0f);
         }
+
+        float sunDot = SolarFacingAmount(c->normal, solar->lightDir);
+        float daylightHeating = climate->dayNightEnabled ? fmaxf(0.0f, sunDot) * (0.16f * climate->solarIntensity) : 0.08f;
+        float radiativeCooling = climate->dayNightEnabled ? fmaxf(0.0f, -sunDot) * (0.10f + land * 0.05f) : 0.0f;
 
         float upslopeFlow = ClampFloat(Vector3DotProduct(wind, terrainGradient) * 18.0f, 0.0f, 1.0f);
         float downslopeFlow = ClampFloat(-Vector3DotProduct(wind, terrainGradient) * 20.0f, 0.0f, 1.0f);
@@ -933,7 +1054,7 @@ static void StepWeatherSimulation(
         float surfaceTemperature = c->surfaceTemperature;
         float coldPool = land * fmaxf(0.0f, -c->elevation) * ClampFloat(1.0f - Vector3Length(c->wind) * 8.0f, 0.0f, 1.0f) * 0.055f;
         float surfaceTarget = ClampFloat(
-            temperatureTarget + land * (equatorHeat - 0.50f) * 0.060f - c->snow * 0.12f - c->soilMoisture * land * 0.035f + rainShadow * land * 0.050f - coldPool,
+            temperatureTarget + land * (equatorHeat - 0.50f) * (0.060f * climate->temperatureContrast) + daylightHeating * (0.80f + land * 0.35f) - radiativeCooling - c->snow * 0.12f - c->soilMoisture * land * 0.035f + rainShadow * land * 0.050f - coldPool,
             0.0f,
             1.0f
         );
@@ -941,9 +1062,21 @@ static void StepWeatherSimulation(
         surfaceTemperature += (surfaceTarget - surfaceTemperature) * surfaceResponse * dt;
         surfaceTemperature = ClampFloat(surfaceTemperature, 0.0f, 1.0f);
 
+        float oceanTemperature = c->oceanTemperature;
+        float oceanBase = ClampFloat(0.08f + 0.88f * powf(equatorHeat, 0.86f) + c->ocean * (0.50f - c->temperature) * 0.065f + daylightHeating * 0.22f - radiativeCooling * 0.10f, 0.0f, 1.0f);
+        float upwelling = coastalContrast * (1.0f - upwindOcean) * 0.28f;
+        float oceanTempTarget = ClampFloat(oceanBase - upwelling - fmaxf(-c->elevation, 0.0f) * 0.12f, 0.0f, 1.0f);
+        float oceanInertia = 0.035f * c->ocean;
+        float currentAdvection = ClampFloat(Vector3Length(c->current) * 6.0f, 0.0f, 1.0f);
+        oceanTemperature += (oceanTempTarget - oceanTemperature) * oceanInertia * dt;
+        oceanTemperature += (oceanTempAvg - oceanTemperature) * (0.12f + 0.68f * currentAdvection) * dt;
+        oceanTemperature += polewardCurrent * c->ocean * 0.075f * dt;
+        oceanTemperature = ClampFloat(oceanTemperature, 0.0f, 1.0f);
+
         float temperature = c->temperature;
         float heatResponse = LerpFloat(0.42f, 0.76f, land);
         temperature += (surfaceTemperature - temperature) * heatResponse * dt;
+        temperature += (oceanTemperature - temperature) * c->ocean * 0.16f * dt;
         temperature += (tempAvg - temperature) * (0.15f + 0.76f * advection) * dt;
         temperature += polewardCurrent * c->ocean * 0.10f * dt;
         temperature += rainShadow * land * 0.070f * dt;
@@ -959,9 +1092,10 @@ static void StepWeatherSimulation(
             1.0f
         );
         float surfaceWetness = ClampFloat(c->ocean + land * landWetness, 0.0f, 1.0f);
+        float evaporationSurfaceTemp = LerpFloat(surfaceTemperature, oceanTemperature, c->ocean);
         float humidityDeficit = ClampFloat((saturation - humidity + 0.16f) / 0.84f, 0.0f, 1.0f);
         float climateHumidity = ClampFloat(0.16f + c->ocean * 0.43f + coastalMoisture * 0.23f + land * c->soilMoisture * 0.28f + itcz * 0.090f + stormTrack * 0.040f - subtropicalHigh * 0.070f + temperature * 0.08f - fmaxf(c->elevation, 0.0f) * 0.085f - rainShadow * 0.30f, 0.0f, 1.18f);
-        float evaporationRate = surfaceWetness * (0.018f + surfaceTemperature * 0.128f + windLen * 0.24f + land * 0.018f) * humidityDeficit;
+        float evaporationRate = surfaceWetness * (0.018f + evaporationSurfaceTemp * 0.128f + windLen * 0.24f + land * 0.018f) * humidityDeficit;
         humidity += evaporationRate * dt;
         humidity += (climateHumidity - humidity) * 0.11f * dt;
         humidity += (humidAvg - humidity) * (0.12f + 0.72f * advection) * dt;
@@ -1031,6 +1165,7 @@ static void StepWeatherSimulation(
         dst[i].snow = snow;
         dst[i].storm = storm;
         dst[i].surfaceTemperature = surfaceTemperature;
+        dst[i].oceanTemperature = oceanTemperature;
         dst[i].soilMoisture = soilMoisture;
         dst[i].cloudWater = cloudWater;
         dst[i].recentRain = recentRain;
@@ -1156,14 +1291,16 @@ static float SphericalNoise3(Vector3 unitDirection, float scale, Vector3 offset,
     return FbmNoise3(p, octaves, lacunarity, gain);
 }
 
-static float WarpedClimateLatitude(Vector3 unitDirection, float strength)
+static float WarpedClimateLatitudeFromAxis(Vector3 unitDirection, Vector3 climateNorth, float equatorShift, float strength)
 {
-    float latAbs = fabsf(unitDirection.y);
+    float axisLatitude = Vector3DotProduct(unitDirection, climateNorth) - equatorShift;
+    axisLatitude = ClampFloat(axisLatitude, -1.0f, 1.0f);
+    float latAbs = fabsf(axisLatitude);
     float planetaryWave = SphericalNoise3(unitDirection, 1.65f, (Vector3){ 23.7f, -18.2f, 9.4f }, 3, 1.92f, 0.54f);
     float eddyWave = SphericalNoise3(unitDirection, 7.8f, (Vector3){ 15.2f, 51.4f, -22.7f }, 2, 2.16f, 0.48f);
     float cellWave = SphericalNoise3(unitDirection, 3.20f, (Vector3){ -40.4f, 21.3f, 66.8f }, 3, 2.08f, 0.52f);
     float warp = (planetaryWave - 0.5f) * strength + (eddyWave - 0.5f) * strength * 0.58f + (cellWave - 0.5f) * strength * 0.36f;
-    return ClampFloat(fabsf(unitDirection.y + warp * (1.0f - latAbs * 0.22f)), 0.0f, 1.0f);
+    return ClampFloat(fabsf(axisLatitude + warp * (1.0f - latAbs * 0.22f)), 0.0f, 1.0f);
 }
 
 static Vector3 TangentEast(Vector3 normal)
@@ -1173,18 +1310,26 @@ static Vector3 TangentEast(Vector3 normal)
     return Vector3Normalize(east);
 }
 
-static Vector3 TangentNorth(Vector3 normal)
+static Vector3 TangentEastFromAxis(Vector3 normal, Vector3 climateNorth)
 {
-    Vector3 north = Vector3Subtract((Vector3){ 0.0f, 1.0f, 0.0f }, Vector3Scale(normal, normal.y));
-    if (Vector3LengthSqr(north) < 0.000001f) north = Vector3CrossProduct(normal, TangentEast(normal));
+    Vector3 east = Vector3CrossProduct(climateNorth, normal);
+    if (Vector3LengthSqr(east) < 0.000001f) east = Vector3CrossProduct((Vector3){ 0.0f, 0.0f, 1.0f }, normal);
+    if (Vector3LengthSqr(east) < 0.000001f) east = Vector3CrossProduct((Vector3){ 1.0f, 0.0f, 0.0f }, normal);
+    return Vector3Normalize(east);
+}
+
+static Vector3 TangentNorthFromAxis(Vector3 normal, Vector3 climateNorth)
+{
+    Vector3 north = Vector3Subtract(climateNorth, Vector3Scale(normal, Vector3DotProduct(climateNorth, normal)));
+    if (Vector3LengthSqr(north) < 0.000001f) north = Vector3CrossProduct(normal, TangentEastFromAxis(normal, climateNorth));
     return Vector3Normalize(north);
 }
 
-static Vector3 ClimateEddyFlow(Vector3 normal, float scale, Vector3 offset, float strength)
+static Vector3 ClimateEddyFlowFromAxis(Vector3 normal, Vector3 climateNorth, float scale, Vector3 offset, float strength)
 {
     const float eps = 0.040f;
-    Vector3 east = TangentEast(normal);
-    Vector3 north = TangentNorth(normal);
+    Vector3 east = TangentEastFromAxis(normal, climateNorth);
+    Vector3 north = TangentNorthFromAxis(normal, climateNorth);
     Vector3 e0 = Vector3Normalize(Vector3Add(normal, Vector3Scale(east, eps)));
     Vector3 e1 = Vector3Normalize(Vector3Subtract(normal, Vector3Scale(east, eps)));
     Vector3 n0 = Vector3Normalize(Vector3Add(normal, Vector3Scale(north, eps)));
@@ -1546,6 +1691,26 @@ static const char *WeatherViewName(WeatherViewMode mode)
         case WEATHER_VIEW_STORM: return "Storm Lift";
         case WEATHER_VIEW_EVAPORATION: return "Evaporation";
         case WEATHER_VIEW_SNOW: return "Snow/Ice";
+        case WEATHER_VIEW_OCEAN_TEMP: return "Ocean Temperature";
+        default: return "Unknown";
+    }
+}
+
+static const char *WeatherViewShortName(WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE: return "Temperature";
+        case WEATHER_VIEW_PRESSURE: return "Pressure";
+        case WEATHER_VIEW_WIND: return "Wind";
+        case WEATHER_VIEW_CURRENT: return "Currents";
+        case WEATHER_VIEW_HUMIDITY: return "Humidity";
+        case WEATHER_VIEW_CLOUD: return "Clouds";
+        case WEATHER_VIEW_RAIN: return "Rain";
+        case WEATHER_VIEW_VORTICITY: return "Vorticity";
+        case WEATHER_VIEW_STORM: return "Storm";
+        case WEATHER_VIEW_EVAPORATION: return "Evaporation";
+        case WEATHER_VIEW_SNOW: return "Snow/Ice";
+        case WEATHER_VIEW_OCEAN_TEMP: return "Ocean Temp";
         default: return "Unknown";
     }
 }
@@ -1648,6 +1813,14 @@ static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
                 (Color){ 248, 250, 252, 255 }
             );
         }
+        case WEATHER_VIEW_OCEAN_TEMP: {
+            return Gradient3(
+                w->oceanTemperature,
+                (Color){ 22, 42, 86, 255 },
+                (Color){ 44, 154, 214, 255 },
+                (Color){ 232, 80, 60, 255 }
+            );
+        }
         default:
             return (Color){ 255, 0, 255, 255 };
     }
@@ -1662,6 +1835,7 @@ static float WeatherViewOverlayStrength(WeatherViewMode mode)
             return 0.52f;
         case WEATHER_VIEW_TEMPERATURE:
         case WEATHER_VIEW_HUMIDITY:
+        case WEATHER_VIEW_OCEAN_TEMP:
             return 0.48f;
         default:
             return 0.62f;
@@ -1679,9 +1853,9 @@ static float Hash2D01(int x, int y, int seed)
     return (float)h / (float)UINT32_MAX;
 }
 
-static Vector3 SunLightDirection(void)
+static Vector3 SunLightDirection(const SolarState *solar)
 {
-    return Vector3Normalize((Vector3){ -0.38f, 0.70f, 0.60f });
+    return solar->lightDir;
 }
 
 static float MaxSurfaceRadius(const Tile *tiles, int tileCount)
@@ -1711,9 +1885,9 @@ static Vector3 AtmosphereScatterCoefficients(float strength)
     };
 }
 
-static void DrawSunIndicator(Camera3D camera)
+static void DrawSunIndicator(Camera3D camera, const SolarState *solar)
 {
-    Vector3 lightDir = SunLightDirection();
+    Vector3 lightDir = SunLightDirection(solar);
     Vector3 sunWorld = Vector3Scale(lightDir, 120.0f);
     Vector3 toSun = Vector3Normalize(Vector3Subtract(sunWorld, camera.position));
     Vector3 cameraForward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
@@ -1725,6 +1899,43 @@ static void DrawSunIndicator(Camera3D camera)
     DrawCircleV(sunScreen, radius * 3.1f, (Color){ 255, 220, 148, 34 });
     DrawCircleV(sunScreen, radius * 2.0f, (Color){ 255, 234, 180, 62 });
     DrawCircleV(sunScreen, radius * 1.1f, (Color){ 255, 244, 208, 246 });
+}
+
+static void DrawSunOrbitGuide(Camera3D camera, const SolarState *solar)
+{
+    const float sunDistance = 120.0f;
+    const int segments = 96;
+    Vector3 cameraForward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    bool havePrev = false;
+    Vector2 prevScreen = { 0 };
+
+    for (int i = 0; i <= segments; i++) {
+        float t = (float)i / (float)segments;
+        float angle = t * 2.0f * PI;
+        Vector3 equatorialSun = Vector3Add(
+            Vector3Scale(solar->orbitRight, cosf(angle)),
+            Vector3Scale(solar->orbitForward, sinf(angle))
+        );
+        Vector3 orbitDir = Vector3Normalize(Vector3Add(
+            Vector3Scale(equatorialSun, cosf(solar->declination)),
+            Vector3Scale(solar->northPole, sinf(solar->declination))
+        ));
+        Vector3 orbitPoint = Vector3Scale(orbitDir, sunDistance);
+        Vector3 toPoint = Vector3Normalize(Vector3Subtract(orbitPoint, camera.position));
+        bool visible = Vector3DotProduct(cameraForward, toPoint) > 0.0f;
+
+        if (!visible) {
+            havePrev = false;
+            continue;
+        }
+
+        Vector2 screen = GetWorldToScreen(orbitPoint, camera);
+        if (havePrev) {
+            DrawLineEx(prevScreen, screen, 1.8f, (Color){ 108, 154, 216, 110 });
+        }
+        prevScreen = screen;
+        havePrev = true;
+    }
 }
 
 static void DrawSpaceBackground(int screenWidth, int screenHeight, float clock)
@@ -1853,6 +2064,8 @@ static void DrawSelectedTileInfo(
     float windSpeed = WeatherWindMetersPerSecond(w->wind);
     float currentSpeed = WeatherCurrentMetersPerSecond(w->current);
     float temperatureC = WeatherTemperatureC(w->temperature);
+    float surfaceTemperatureC = WeatherTemperatureC(w->surfaceTemperature);
+    float oceanTemperatureC = WeatherTemperatureC(w->oceanTemperature);
     float pressureHpa = WeatherPressureHpa(w->pressure);
     float humidityPct = WeatherRelativeHumidity(w->humidity, w->temperature) * 100.0f;
     float cloudPct = ClampFloat(fmaxf(w->cloud, w->cloudWater), 0.0f, 1.0f) * 100.0f;
@@ -1864,8 +2077,8 @@ static void DrawSelectedTileInfo(
     float liftPct = ClampFloat(w->orographicLift, 0.0f, 1.0f) * 100.0f;
     float vorticityE5 = w->vorticity * 8.0f;
 
-    DrawRectangle(14, 14, 460, 292, (Color){ 6, 10, 16, 198 });
-    DrawRectangleLines(14, 14, 460, 292, (Color){ 175, 189, 209, 180 });
+    DrawRectangle(14, 14, 460, 312, (Color){ 6, 10, 16, 198 });
+    DrawRectangleLines(14, 14, 460, 312, (Color){ 175, 189, 209, 180 });
 
     int x = 26;
     int y = 24;
@@ -1881,6 +2094,8 @@ static void DrawSelectedTileInfo(
     snprintf(line, sizeof(line), "Oceanic %.2f  Density %.2f  Age %.2f", plate->oceanic, plate->density, plate->crustAge);
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
     snprintf(line, sizeof(line), "Temperature %.1f C", temperatureC);
+    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
+    snprintf(line, sizeof(line), "Surface %.1f C  Ocean %.1f C", surfaceTemperatureC, oceanTemperatureC);
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
     snprintf(line, sizeof(line), "Pressure %.0f hPa", pressureHpa);
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
@@ -1900,44 +2115,321 @@ static void DrawSelectedTileInfo(
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 });
 }
 
-static void DrawViewThemeInfo(
-    bool showPlateView,
-    bool atmosphereEnabled,
-    bool weatherEnabled,
-    WeatherViewMode weatherView,
-    bool tectonicsPaused
+static int gPanelActiveWidgetId = 0;
+static int gPanelNextWidgetId = 1;
+
+static Rectangle ControlPanelBounds(void)
+{
+    float width = 418.0f;
+    float height = (float)GetScreenHeight() - 36.0f;
+    if (height < 520.0f) height = 520.0f;
+    float x = fmaxf(18.0f, (float)GetScreenWidth() - width - 18.0f);
+    return (Rectangle){ x, 18.0f, width, height };
+}
+
+static Rectangle SidebarToggleBounds(bool panelOpen)
+{
+    if (panelOpen) {
+        Rectangle bounds = ControlPanelBounds();
+        return (Rectangle){ bounds.x + bounds.width - 42.0f, bounds.y + 10.0f, 28.0f, 28.0f };
+    }
+
+    float width = 40.0f;
+    float height = 118.0f;
+    float x = (float)GetScreenWidth() - width - 18.0f;
+    return (Rectangle){ x, 18.0f, width, height };
+}
+
+static void PanelBeginFrame(void)
+{
+    gPanelNextWidgetId = 1;
+}
+
+static int PanelNextWidgetId(void)
+{
+    return gPanelNextWidgetId++;
+}
+
+static Rectangle PanelConsumeRect(PanelLayout *layout, float height)
+{
+    Rectangle rect = { layout->contentX, layout->clipRect.y + layout->cursorY - layout->scrollY, layout->contentWidth, height };
+    layout->cursorY += height + 6.0f;
+    return rect;
+}
+
+static bool PanelIsInteractive(PanelLayout *layout, Rectangle rect)
+{
+    Vector2 mouse = GetMousePosition();
+    return CheckCollisionPointRec(mouse, rect) && CheckCollisionPointRec(mouse, layout->clipRect);
+}
+
+static void PanelDrawSectionTitle(PanelLayout *layout, const char *title)
+{
+    Rectangle rect = PanelConsumeRect(layout, 24.0f);
+    DrawRectangleRounded(rect, 0.06f, 6, (Color){ 19, 38, 68, 240 });
+    DrawRectangleRoundedLinesEx(rect, 0.06f, 6, 1.0f, (Color){ 52, 92, 150, 210 });
+    DrawText(title, (int)rect.x + 12, (int)rect.y + 3, 18, (Color){ 238, 244, 252, 255 });
+}
+
+static void PanelDrawTextRow(PanelLayout *layout, const char *left, const char *right)
+{
+    Rectangle rect = PanelConsumeRect(layout, 18.0f);
+    DrawText(left, (int)rect.x + 2, (int)rect.y, 17, (Color){ 214, 224, 239, 255 });
+    int valueWidth = MeasureText(right, 17);
+    DrawText(right, (int)(rect.x + rect.width - valueWidth), (int)rect.y, 17, (Color){ 176, 201, 233, 255 });
+}
+
+static bool PanelButton(PanelLayout *layout, const char *label)
+{
+    Rectangle rect = PanelConsumeRect(layout, 28.0f);
+    bool hovered = PanelIsInteractive(layout, rect);
+    int id = PanelNextWidgetId();
+    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
+    bool triggered = (gPanelActiveWidgetId == id && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT));
+    if (gPanelActiveWidgetId == id && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    Color fill = (gPanelActiveWidgetId == id && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) ? (Color){ 30, 74, 132, 255 }
+        : hovered ? (Color){ 26, 61, 110, 255 }
+        : (Color){ 18, 42, 78, 255 };
+    DrawRectangleRounded(rect, 0.08f, 8, fill);
+    DrawRectangleRoundedLinesEx(rect, 0.08f, 8, 1.0f, (Color){ 63, 119, 192, 220 });
+    int textWidth = MeasureText(label, 17);
+    DrawText(label, (int)(rect.x + rect.width * 0.5f - textWidth * 0.5f), (int)rect.y + 5, 17, (Color){ 238, 244, 252, 255 });
+    return triggered;
+}
+
+static bool PanelCheckbox(PanelLayout *layout, const char *label, bool *value)
+{
+    Rectangle rect = PanelConsumeRect(layout, 24.0f);
+    bool hovered = PanelIsInteractive(layout, rect);
+    int id = PanelNextWidgetId();
+    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
+    bool changed = false;
+    if (gPanelActiveWidgetId == id && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        *value = !*value;
+        changed = true;
+    }
+    if (gPanelActiveWidgetId == id && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    Rectangle box = { rect.x + 2.0f, rect.y + 2.0f, 18.0f, 18.0f };
+    DrawRectangleRounded(box, 0.12f, 6, *value ? (Color){ 44, 102, 178, 255 } : (Color){ 12, 21, 36, 255 });
+    DrawRectangleRoundedLinesEx(box, 0.12f, 6, 1.0f, hovered ? (Color){ 115, 176, 244, 255 } : (Color){ 71, 111, 168, 230 });
+    if (*value) {
+        DrawLineEx((Vector2){ box.x + 4.0f, box.y + 10.0f }, (Vector2){ box.x + 9.0f, box.y + 15.0f }, 2.5f, (Color){ 242, 247, 255, 255 });
+        DrawLineEx((Vector2){ box.x + 9.0f, box.y + 15.0f }, (Vector2){ box.x + 16.0f, box.y + 5.0f }, 2.5f, (Color){ 242, 247, 255, 255 });
+    }
+    DrawText(label, (int)rect.x + 32, (int)rect.y + 1, 17, hovered ? (Color){ 236, 242, 251, 255 } : (Color){ 214, 224, 239, 255 });
+    return changed;
+}
+
+static bool PanelSliderFloat(PanelLayout *layout, const char *label, float *value, float minValue, float maxValue, const char *format)
+{
+    Rectangle rect = PanelConsumeRect(layout, 34.0f);
+    Rectangle track = { rect.x, rect.y + 21.0f, rect.width, 6.0f };
+    Vector2 mouse = GetMousePosition();
+    int id = PanelNextWidgetId();
+    bool hovered = CheckCollisionPointRec(mouse, (Rectangle){ track.x - 4.0f, rect.y, track.width + 8.0f, rect.height }) && CheckCollisionPointRec(mouse, layout->clipRect);
+
+    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
+    bool changed = false;
+    if (gPanelActiveWidgetId == id) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            float t = ClampFloat((mouse.x - track.x) / track.width, 0.0f, 1.0f);
+            *value = LerpFloat(minValue, maxValue, t);
+            changed = true;
+        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            gPanelActiveWidgetId = 0;
+        }
+    }
+
+    float t = (*value - minValue) / (maxValue - minValue);
+    t = ClampFloat(t, 0.0f, 1.0f);
+    float knobX = track.x + t * track.width;
+    char valueText[64];
+    snprintf(valueText, sizeof(valueText), format, *value);
+    DrawText(label, (int)rect.x + 2, (int)rect.y, 17, (Color){ 214, 224, 239, 255 });
+    int textWidth = MeasureText(valueText, 17);
+    DrawText(valueText, (int)(rect.x + rect.width - textWidth), (int)rect.y, 17, (Color){ 176, 201, 233, 255 });
+    DrawRectangleRounded(track, 0.5f, 8, (Color){ 12, 21, 36, 255 });
+    Rectangle fill = { track.x, track.y, track.width * t, track.height };
+    DrawRectangleRounded(fill, 0.5f, 8, (Color){ 47, 112, 194, 255 });
+    DrawCircleV((Vector2){ knobX, track.y + track.height * 0.5f }, 6.5f,
+        (gPanelActiveWidgetId == id) ? (Color){ 214, 236, 255, 255 } : hovered ? (Color){ 178, 220, 255, 255 } : (Color){ 132, 190, 244, 255 });
+    return changed;
+}
+
+static void PanelDrawWeatherViewSelector(PanelLayout *layout, WeatherViewMode *weatherView)
+{
+    Rectangle row = PanelConsumeRect(layout, 28.0f);
+    Rectangle left = { row.x, row.y, 36.0f, row.height };
+    Rectangle right = { row.x + row.width - 36.0f, row.y, 36.0f, row.height };
+    Rectangle center = { left.x + left.width + 8.0f, row.y, row.width - left.width - right.width - 16.0f, row.height };
+    int leftId = PanelNextWidgetId();
+    bool hoverLeft = PanelIsInteractive(layout, left);
+    if (hoverLeft && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = leftId;
+    if (gPanelActiveWidgetId == leftId && hoverLeft && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        *weatherView = (WeatherViewMode)((*weatherView + WEATHER_VIEW_COUNT - 1) % WEATHER_VIEW_COUNT);
+    }
+    if (gPanelActiveWidgetId == leftId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    int rightId = PanelNextWidgetId();
+    bool hoverRight = PanelIsInteractive(layout, right);
+    if (hoverRight && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = rightId;
+    if (gPanelActiveWidgetId == rightId && hoverRight && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        *weatherView = (WeatherViewMode)((*weatherView + 1) % WEATHER_VIEW_COUNT);
+    }
+    if (gPanelActiveWidgetId == rightId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    DrawRectangleRounded(left, 0.10f, 8, hoverLeft ? (Color){ 26, 61, 110, 255 } : (Color){ 18, 42, 78, 255 });
+    DrawRectangleRounded(right, 0.10f, 8, hoverRight ? (Color){ 26, 61, 110, 255 } : (Color){ 18, 42, 78, 255 });
+    DrawRectangleRounded(center, 0.08f, 8, (Color){ 12, 21, 36, 255 });
+    DrawRectangleRoundedLinesEx(left, 0.10f, 8, 1.0f, (Color){ 63, 119, 192, 220 });
+    DrawRectangleRoundedLinesEx(right, 0.10f, 8, 1.0f, (Color){ 63, 119, 192, 220 });
+    DrawRectangleRoundedLinesEx(center, 0.08f, 8, 1.0f, (Color){ 52, 92, 150, 210 });
+    DrawText("<", (int)left.x + 11, (int)left.y + 4, 17, (Color){ 238, 244, 252, 255 });
+    DrawText(">", (int)right.x + 11, (int)right.y + 4, 17, (Color){ 238, 244, 252, 255 });
+    const char *label = WeatherViewShortName(*weatherView);
+    int fontSize = 16;
+    int labelWidth = MeasureText(label, fontSize);
+    if (labelWidth > (int)center.width - 18) {
+        fontSize = 15;
+        labelWidth = MeasureText(label, fontSize);
+    }
+    DrawText(label, (int)(center.x + center.width * 0.5f - labelWidth * 0.5f), (int)center.y + 5, fontSize, (Color){ 238, 244, 252, 255 });
+}
+
+static bool DrawControlPanel(
+    ClimateSettings *climate,
+    bool *showPlateView,
+    bool *atmosphereEnabled,
+    bool *weatherEnabled,
+    bool *tectonicsPaused,
+    WeatherViewMode *weatherView,
+    bool *resetWeatherRequested,
+    const SolarState *solar
 )
 {
-    const char *viewLine = showPlateView ? "View: Plates" : (weatherEnabled ? "View: Weather" : "View: Terrain");
-    char modeLine[96];
-    snprintf(modeLine, sizeof(modeLine), "Weather Mode: %s", WeatherViewName(weatherView));
-    char stateLine[120];
-    snprintf(stateLine, sizeof(stateLine), "Weather: %s  Atmosphere: %s  Tectonics: %s", weatherEnabled ? "On" : "Off", atmosphereEnabled ? "On" : "Off", tectonicsPaused ? "Paused" : "Running");
-    char controlsLine[96];
-    snprintf(controlsLine, sizeof(controlsLine), "A Atmosphere  C Plates  W Weather");
+    Rectangle bounds = ControlPanelBounds();
+    Vector2 mouse = GetMousePosition();
+    bool hovered = climate->panelOpen && CheckCollisionPointRec(mouse, bounds);
+    if (!climate->panelOpen) return false;
 
-    int font = 18;
-    int pad = 12;
-    int gap = 6;
-    int w1 = MeasureText(viewLine, font);
-    int w2 = MeasureText(modeLine, font);
-    int w3 = MeasureText(stateLine, font);
-    int w4 = MeasureText(controlsLine, font);
-    int width = w1;
-    if (w2 > width) width = w2;
-    if (w3 > width) width = w3;
-    if (w4 > width) width = w4;
-    width += pad * 2;
-    int height = pad * 2 + font * 4 + gap * 3;
+    Rectangle clipRect = {
+        bounds.x + 16.0f,
+        bounds.y + 66.0f,
+        bounds.width - 44.0f,
+        bounds.height - 82.0f
+    };
+    float maxScroll = fmaxf(0.0f, climate->panelContentHeight - clipRect.height);
+    if (hovered) {
+        float wheel = GetMouseWheelMove();
+        if (wheel != 0.0f) climate->panelScroll = ClampFloat(climate->panelScroll - wheel * 34.0f, 0.0f, maxScroll);
+    }
 
-    int x = GetScreenWidth() - width - 14;
-    int y = 14;
-    DrawRectangle(x, y, width, height, (Color){ 6, 10, 16, 198 });
-    DrawRectangleLines(x, y, width, height, (Color){ 175, 189, 209, 180 });
-    DrawText(viewLine, x + pad, y + pad, font, (Color){ 244, 248, 255, 255 });
-    DrawText(modeLine, x + pad, y + pad + font + gap, font, (Color){ 210, 220, 236, 255 });
-    DrawText(stateLine, x + pad, y + pad + (font + gap) * 2, font, (Color){ 210, 220, 236, 255 });
-    DrawText(controlsLine, x + pad, y + pad + (font + gap) * 3, font, (Color){ 182, 198, 218, 255 });
+    PanelBeginFrame();
+    DrawRectangleRounded(bounds, 0.03f, 8, (Color){ 10, 14, 22, 240 });
+    DrawRectangleRoundedLinesEx(bounds, 0.03f, 8, 1.0f, (Color){ 41, 70, 119, 220 });
+    DrawRectangle((int)bounds.x, (int)bounds.y, (int)bounds.width, 52, (Color){ 16, 29, 52, 250 });
+    DrawText("Controls", (int)bounds.x + 16, (int)bounds.y + 14, 26, (Color){ 240, 245, 252, 255 });
+
+    Rectangle toggleRect = SidebarToggleBounds(true);
+    bool toggleHover = CheckCollisionPointRec(mouse, toggleRect);
+    if (toggleHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = -100;
+    if (gPanelActiveWidgetId == -100 && toggleHover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) climate->panelOpen = false;
+    if (gPanelActiveWidgetId == -100 && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+    DrawRectangleRounded(toggleRect, 0.18f, 6, toggleHover ? (Color){ 30, 66, 118, 255 } : (Color){ 20, 44, 80, 255 });
+    DrawRectangleRoundedLinesEx(toggleRect, 0.18f, 6, 1.0f, (Color){ 89, 144, 216, 220 });
+    DrawText("X", (int)toggleRect.x + 9, (int)toggleRect.y + 5, 18, (Color){ 238, 244, 252, 255 });
+
+    PanelLayout layout = {
+        .bounds = bounds,
+        .clipRect = clipRect,
+        .cursorY = 0.0f,
+        .contentX = clipRect.x + 6.0f,
+        .contentWidth = clipRect.width - 12.0f,
+        .scrollY = climate->panelScroll,
+    };
+
+    BeginScissorMode((int)clipRect.x, (int)clipRect.y, (int)clipRect.width, (int)clipRect.height);
+
+    char summary[96];
+    snprintf(summary, sizeof(summary), "Day %.2f   Year %.2f", climate->dayPhase, climate->yearPhase);
+    PanelDrawTextRow(&layout, "Solar Clock", summary);
+    snprintf(summary, sizeof(summary), "Sun %.0f deg", asinf(SolarFacingAmount(solar->lightDir, solar->northPole)) * RAD2DEG);
+    PanelDrawTextRow(&layout, "Declination", summary);
+    snprintf(summary, sizeof(summary), "FPS %.1f", GetFPS() * 1.0f);
+    PanelDrawTextRow(&layout, "Performance", summary);
+
+    PanelDrawSectionTitle(&layout, "Simulation");
+    PanelCheckbox(&layout, "Atmosphere", atmosphereEnabled);
+    PanelCheckbox(&layout, "Weather", weatherEnabled);
+    PanelCheckbox(&layout, "Plate View", showPlateView);
+    PanelCheckbox(&layout, "Pause Tectonics", tectonicsPaused);
+
+    PanelDrawSectionTitle(&layout, "Time And Sun");
+    PanelCheckbox(&layout, "Auto Advance Time", &climate->autoAdvanceTime);
+    PanelCheckbox(&layout, "Day/Night Heating", &climate->dayNightEnabled);
+    PanelCheckbox(&layout, "Seasonal Shift", &climate->seasonsEnabled);
+    PanelCheckbox(&layout, "Show Sun Orbit", &climate->showSunOrbit);
+    PanelSliderFloat(&layout, "Day Phase", &climate->dayPhase, 0.0f, 1.0f, "%.2f");
+    climate->dayPhase = Wrap01(climate->dayPhase);
+    PanelSliderFloat(&layout, "Year Phase", &climate->yearPhase, 0.0f, 1.0f, "%.2f");
+    climate->yearPhase = Wrap01(climate->yearPhase);
+    PanelSliderFloat(&layout, "Day Speed", &climate->daySpeed, 0.0f, 4.0f, "%.2fx");
+    PanelSliderFloat(&layout, "Year Speed", &climate->yearSpeed, 0.0f, 4.0f, "%.2fx");
+    PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 45.0f, "%.1f deg");
+    PanelSliderFloat(&layout, "Solar Intensity", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
+
+    PanelDrawSectionTitle(&layout, "Weather And Atmosphere");
+    PanelSliderFloat(&layout, "Weather Speed", &climate->weatherTimeScale, 0.25f, 6.0f, "%.2fx");
+    PanelSliderFloat(&layout, "Temp Contrast", &climate->temperatureContrast, 0.50f, 1.80f, "%.2fx");
+    PanelSliderFloat(&layout, "Atmo Density", &climate->atmosphereDensityFalloff, 1.20f, 4.60f, "%.2f");
+    PanelSliderFloat(&layout, "Atmo Scatter", &climate->atmosphereScatteringScale, 0.25f, 2.40f, "%.2fx");
+    if (PanelButton(&layout, "Reset Weather To Current Climate")) *resetWeatherRequested = true;
+
+    PanelDrawSectionTitle(&layout, "Views");
+    PanelDrawWeatherViewSelector(&layout, weatherView);
+
+    EndScissorMode();
+
+    climate->panelContentHeight = layout.cursorY;
+    maxScroll = fmaxf(0.0f, climate->panelContentHeight - clipRect.height);
+    climate->panelScroll = ClampFloat(climate->panelScroll, 0.0f, maxScroll);
+
+    DrawRectangleRounded(clipRect, 0.03f, 6, (Color){ 0, 0, 0, 0 });
+    DrawRectangleLinesEx(clipRect, 1.0f, (Color){ 28, 45, 74, 180 });
+    if (maxScroll > 0.0f) {
+        Rectangle bar = { bounds.x + bounds.width - 14.0f, clipRect.y, 6.0f, clipRect.height };
+        float thumbHeight = fmaxf(28.0f, clipRect.height * (clipRect.height / climate->panelContentHeight));
+        float thumbTravel = bar.height - thumbHeight;
+        float thumbOffset = (maxScroll > 0.0f) ? (climate->panelScroll / maxScroll) * thumbTravel : 0.0f;
+        Rectangle thumb = { bar.x, bar.y + thumbOffset, bar.width, thumbHeight };
+        DrawRectangleRounded(bar, 0.5f, 8, (Color){ 12, 21, 36, 255 });
+        DrawRectangleRounded(thumb, 0.5f, 8, hovered ? (Color){ 84, 145, 222, 255 } : (Color){ 58, 110, 182, 255 });
+    }
+
+    return hovered;
+}
+
+static bool DrawCollapsedSidebarToggle(bool *panelOpen)
+{
+    Rectangle rect = SidebarToggleBounds(false);
+    Vector2 mouse = GetMousePosition();
+    bool hovered = CheckCollisionPointRec(mouse, rect);
+    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = -101;
+    bool opened = false;
+    if (gPanelActiveWidgetId == -101 && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        *panelOpen = true;
+        opened = true;
+    }
+    if (gPanelActiveWidgetId == -101 && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    DrawRectangleRounded(rect, 0.18f, 8, hovered ? (Color){ 18, 42, 78, 240 } : (Color){ 10, 20, 36, 240 });
+    DrawRectangleRoundedLinesEx(rect, 0.18f, 8, 1.0f, (Color){ 89, 144, 216, 220 });
+    DrawText(">", (int)rect.x + 12, (int)rect.y + 10, 20, (Color){ 238, 244, 252, 255 });
+    DrawText("UI", (int)rect.x + 9, (int)rect.y + 42, 18, (Color){ 214, 224, 239, 255 });
+    DrawText("Open", (int)rect.x + 4, (int)rect.y + 70, 16, (Color){ 176, 201, 233, 255 });
+    return hovered || opened;
 }
 
 static void DrawWeatherClouds(
@@ -2152,12 +2644,33 @@ int main(void)
     int atmosphereDensityFalloffLoc = GetShaderLocation(atmosphereShader, "densityFalloff");
     int atmosphereScatteringStrengthLoc = GetShaderLocation(atmosphereShader, "scatteringStrength");
 
+    ClimateSettings climate = {
+        .panelOpen = true,
+        .autoAdvanceTime = true,
+        .dayNightEnabled = true,
+        .seasonsEnabled = true,
+        .showSunOrbit = false,
+        .dayPhase = 0.18f,
+        .yearPhase = 0.08f,
+        .daySpeed = 1.0f,
+        .yearSpeed = 1.0f,
+        .axialTiltDegrees = 23.5f,
+        .solarIntensity = 1.0f,
+        .weatherTimeScale = WEATHER_TIME_SCALE,
+        .temperatureContrast = 1.0f,
+        .atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF,
+        .atmosphereScatteringScale = 1.0f,
+        .panelScroll = 0.0f,
+        .panelContentHeight = 0.0f,
+    };
+    SolarState solar = BuildSolarState(&climate);
+
     Vector3 atmosphereScatterCoefficients = AtmosphereScatterCoefficients(ATMOSPHERE_SCATTERING_STRENGTH);
-    Vector3 sunLightDirection = SunLightDirection();
+    Vector3 sunLightDirection = SunLightDirection(&solar);
     float atmospherePlanetRadius = PLANET_RADIUS;
     float atmosphereOuterRadius = PLANET_RADIUS + ATMOSPHERE_SURFACE_MARGIN;
-    float atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF;
-    float atmosphereScatteringStrength = 1.0f;
+    float atmosphereDensityFalloff = climate.atmosphereDensityFalloff;
+    float atmosphereScatteringStrength = climate.atmosphereScatteringScale;
 
     SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
     SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
@@ -2184,7 +2697,7 @@ int main(void)
     Tile *tiles = BuildPlanetTiles(&vertices, &triangles, triangleDirections, triangleSurfacePoints, plates, plateCount, PLANET_RADIUS, &tileCount);
     WeatherCell *weatherA = (WeatherCell *)calloc((size_t)tileCount, sizeof(WeatherCell));
     WeatherCell *weatherB = (WeatherCell *)calloc((size_t)tileCount, sizeof(WeatherCell));
-    InitializeWeather(weatherA, tiles, tileCount);
+    InitializeWeather(weatherA, tiles, tileCount, &climate, &solar);
     memcpy(weatherB, weatherA, sizeof(WeatherCell) * (size_t)tileCount);
     atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
     SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
@@ -2210,13 +2723,20 @@ int main(void)
     const float tectonicRebuildStep = 1.0f / TECTONIC_REBUILD_HZ;
     float weatherTimer = 0.0f;
     const float weatherStep = 1.0f / WEATHER_UPDATE_HZ;
+    bool resetWeatherRequested = false;
 
     while (!WindowShouldClose()) {
-        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) clickStart = GetMousePosition();
+        Rectangle controlPanelRect = ControlPanelBounds();
+        Rectangle sidebarToggleRect = SidebarToggleBounds(climate.panelOpen);
+        bool controlPanelHovered = climate.panelOpen && CheckCollisionPointRec(GetMousePosition(), controlPanelRect);
+        bool sidebarToggleHovered = CheckCollisionPointRec(GetMousePosition(), sidebarToggleRect);
+        bool uiHovered = controlPanelHovered || sidebarToggleHovered;
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiHovered) clickStart = GetMousePosition();
         if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
         if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
         if (IsKeyPressed(KEY_SPACE)) tectonicsPaused = !tectonicsPaused;
         if (IsKeyPressed(KEY_W)) weatherEnabled = !weatherEnabled;
+        if (IsKeyPressed(KEY_F1)) climate.panelOpen = !climate.panelOpen;
         if (IsKeyPressed(KEY_TAB)) weatherView = (WeatherViewMode)((weatherView + 1) % WEATHER_VIEW_COUNT);
         if (IsKeyPressed(KEY_ONE)) weatherView = WEATHER_VIEW_TEMPERATURE;
         if (IsKeyPressed(KEY_TWO)) weatherView = WEATHER_VIEW_PRESSURE;
@@ -2229,7 +2749,27 @@ int main(void)
         if (IsKeyPressed(KEY_NINE)) weatherView = WEATHER_VIEW_STORM;
         if (IsKeyPressed(KEY_E)) weatherView = WEATHER_VIEW_EVAPORATION;
         if (IsKeyPressed(KEY_ZERO)) weatherView = WEATHER_VIEW_SNOW;
+        if (IsKeyPressed(KEY_R)) weatherView = WEATHER_VIEW_OCEAN_TEMP;
         float dt = GetFrameTime();
+
+        if (climate.autoAdvanceTime) {
+            climate.dayPhase = Wrap01(climate.dayPhase + dt * 0.020f * climate.daySpeed);
+            climate.yearPhase = Wrap01(climate.yearPhase + dt * 0.0035f * climate.yearSpeed);
+        }
+        solar = BuildSolarState(&climate);
+        sunLightDirection = SunLightDirection(&solar);
+        atmosphereDensityFalloff = climate.atmosphereDensityFalloff;
+        atmosphereScatteringStrength = climate.atmosphereScatteringScale;
+        SetShaderValue(atmosphereShader, atmosphereLightDirLoc, &sunLightDirection.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(atmosphereShader, atmosphereDensityFalloffLoc, &atmosphereDensityFalloff, SHADER_UNIFORM_FLOAT);
+        SetShaderValue(atmosphereShader, atmosphereScatteringStrengthLoc, &atmosphereScatteringStrength, SHADER_UNIFORM_FLOAT);
+
+        if (resetWeatherRequested) {
+            InitializeWeather(weatherA, tiles, tileCount, &climate, &solar);
+            memcpy(weatherB, weatherA, sizeof(WeatherCell) * (size_t)tileCount);
+            weatherTimer = 0.0f;
+            resetWeatherRequested = false;
+        }
 
         if (!tectonicsPaused) {
             AdvancePlateSimulation(plates, plateCount, dt * TECTONIC_TIME_SCALE);
@@ -2243,10 +2783,10 @@ int main(void)
         }
 
         if (weatherEnabled) {
-            weatherTimer += dt * WEATHER_TIME_SCALE;
+            weatherTimer += dt * climate.weatherTimeScale;
             while (weatherTimer >= weatherStep) {
                 RefreshWeatherSurface(weatherA, tiles, tileCount);
-                StepWeatherSimulation(tileGraph, weatherA, weatherB, tileCount, weatherStep);
+                StepWeatherSimulation(tileGraph, weatherA, weatherB, tileCount, weatherStep, &climate, &solar);
                 WeatherCell *swap = weatherA;
                 weatherA = weatherB;
                 weatherB = swap;
@@ -2254,7 +2794,7 @@ int main(void)
             }
         }
 
-        UpdateOrbitCamera(&orbit, &camera);
+        UpdateOrbitCamera(&orbit, &camera, !uiHovered);
         if (IsWindowResized()) {
             int width = GetScreenWidth();
             int height = GetScreenHeight();
@@ -2263,7 +2803,7 @@ int main(void)
                 sceneTexture = LoadRenderTexture(width, height);
             }
         }
-        if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        if (!uiHovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
             Vector2 end = GetMousePosition();
             float dx = end.x - clickStart.x;
             float dy = end.y - clickStart.y;
@@ -2304,7 +2844,8 @@ int main(void)
 
         BeginDrawing();
         DrawSpaceBackground(screenWidth, screenHeight, (float)GetTime());
-        DrawSunIndicator(camera);
+        if (climate.showSunOrbit) DrawSunOrbitGuide(camera, &solar);
+        DrawSunIndicator(camera, &solar);
         if (atmosphereEnabled) {
             BeginShaderMode(atmosphereShader);
             DrawTexturePro(sceneTexture.texture, source, destination, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
@@ -2314,7 +2855,11 @@ int main(void)
         }
 
         DrawSelectedTileInfo(tiles, plates, weatherA, tileCount, selectedTile, tectonicsPaused, weatherEnabled, weatherView);
-        DrawViewThemeInfo(showPlateView, atmosphereEnabled, weatherEnabled, weatherView, tectonicsPaused);
+        if (climate.panelOpen) {
+            DrawControlPanel(&climate, &showPlateView, &atmosphereEnabled, &weatherEnabled, &tectonicsPaused, &weatherView, &resetWeatherRequested, &solar);
+        } else {
+            DrawCollapsedSidebarToggle(&climate.panelOpen);
+        }
 
         EndDrawing();
     }
