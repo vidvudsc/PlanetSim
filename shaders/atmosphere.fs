@@ -105,7 +105,7 @@ void main()
 {
     vec4 sceneColor = texture(texture0, fragTexCoord) * fragColor;
 
-    vec2 screenUV = vec2(fragTexCoord.x, 1.0 - fragTexCoord.y);
+    vec2 screenUV = fragTexCoord;
     vec2 ndc = screenUV * 2.0 - 1.0;
     float tanHalfFov = tan(radians(cameraFovY) * 0.5);
     vec3 rayDir = normalize(
