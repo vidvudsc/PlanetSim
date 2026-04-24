@@ -190,6 +190,7 @@ typedef enum WeatherViewMode {
     WEATHER_VIEW_EVAPORATION,
     WEATHER_VIEW_SNOW,
     WEATHER_VIEW_OCEAN_TEMP,
+    WEATHER_VIEW_BIOME,
     WEATHER_VIEW_COUNT
 } WeatherViewMode;
 
@@ -1692,6 +1693,7 @@ static const char *WeatherViewName(WeatherViewMode mode)
         case WEATHER_VIEW_EVAPORATION: return "Evaporation";
         case WEATHER_VIEW_SNOW: return "Snow/Ice";
         case WEATHER_VIEW_OCEAN_TEMP: return "Ocean Temperature";
+        case WEATHER_VIEW_BIOME: return "Biomes";
         default: return "Unknown";
     }
 }
@@ -1711,8 +1713,46 @@ static const char *WeatherViewShortName(WeatherViewMode mode)
         case WEATHER_VIEW_EVAPORATION: return "Evaporation";
         case WEATHER_VIEW_SNOW: return "Snow/Ice";
         case WEATHER_VIEW_OCEAN_TEMP: return "Ocean Temp";
+        case WEATHER_VIEW_BIOME: return "Biomes";
         default: return "Unknown";
     }
+}
+
+static Color GetBiomeColor(const WeatherCell *w)
+{
+    if (w->ocean > 0.65f) {
+        return (Color){ 18, 62, 118, 255 };
+    }
+    if (w->snow > 0.35f || w->surfaceTemperature < 0.08f) {
+        return (Color){ 228, 234, 240, 255 };
+    }
+
+    float temp = w->temperature;
+    float precip = fmaxf(w->precipitation, w->recentRain * 0.55f);
+    float moisture = w->soilMoisture * 0.55f + precip * 0.35f + w->humidity * 0.10f;
+
+    if (temp < 0.18f) {
+        if (moisture < 0.22f) return (Color){ 182, 178, 166, 255 };
+        return (Color){ 120, 150, 124, 255 };
+    }
+    if (temp < 0.38f) {
+        if (moisture < 0.16f) return (Color){ 178, 162, 120, 255 };
+        if (moisture < 0.32f) return (Color){ 96, 138, 72, 255 };
+        return (Color){ 48, 108, 58, 255 };
+    }
+    if (temp < 0.58f) {
+        if (moisture < 0.12f) return (Color){ 186, 168, 118, 255 };
+        if (moisture < 0.28f) return (Color){ 108, 148, 62, 255 };
+        return (Color){ 42, 102, 52, 255 };
+    }
+    if (temp < 0.78f) {
+        if (moisture < 0.10f) return (Color){ 194, 174, 122, 255 };
+        if (moisture < 0.24f) return (Color){ 118, 154, 58, 255 };
+        return (Color){ 38, 96, 48, 255 };
+    }
+    if (moisture < 0.08f) return (Color){ 202, 180, 128, 255 };
+    if (moisture < 0.20f) return (Color){ 128, 148, 52, 255 };
+    return (Color){ 34, 88, 44, 255 };
 }
 
 static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
@@ -1821,6 +1861,9 @@ static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
                 (Color){ 232, 80, 60, 255 }
             );
         }
+        case WEATHER_VIEW_BIOME: {
+            return GetBiomeColor(w);
+        }
         default:
             return (Color){ 255, 0, 255, 255 };
     }
@@ -1837,6 +1880,8 @@ static float WeatherViewOverlayStrength(WeatherViewMode mode)
         case WEATHER_VIEW_HUMIDITY:
         case WEATHER_VIEW_OCEAN_TEMP:
             return 0.48f;
+        case WEATHER_VIEW_BIOME:
+            return 0.72f;
         default:
             return 0.62f;
     }
@@ -2750,6 +2795,7 @@ int main(void)
         if (IsKeyPressed(KEY_E)) weatherView = WEATHER_VIEW_EVAPORATION;
         if (IsKeyPressed(KEY_ZERO)) weatherView = WEATHER_VIEW_SNOW;
         if (IsKeyPressed(KEY_R)) weatherView = WEATHER_VIEW_OCEAN_TEMP;
+        if (IsKeyPressed(KEY_B)) weatherView = WEATHER_VIEW_BIOME;
         float dt = GetFrameTime();
 
         if (climate.autoAdvanceTime) {
