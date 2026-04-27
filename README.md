@@ -15,20 +15,27 @@ Weather is physically motivated: trade winds and westerlies drive atmospheric ci
 - **Terrain-driven weather** — orographic lift, rain shadows, valley channeling, cold pooling
 - **Ocean currents** — gyre patterns, wind-driven drift, Coriolis deflection
 - **Sun-driven climate** — day/night heating, axial tilt, seasons, and ocean heat transport
-- **12 visualization modes** — temperature, pressure, wind, humidity, clouds, rain, snow, vorticity, ocean temperature, and more
+- **Biome classification** — temperature × moisture based biome map with neighbor blending
+- **Ocean temperature simulation** — thermal inertia, current advection, coastal upwelling
 - **Live control panel** — adjust weather speed, solar forcing, tilt, atmosphere tuning, and view modes in real time
+- **Sun orbit guide** — visualize the sun's seasonal path around the planet
+- **13 visualization modes** — temperature, pressure, wind, currents, humidity, clouds, rain, snow, vorticity, storm, evaporation, ocean temperature, biomes
 
 ---
 
 ## Screenshots
 
-| Wind | Ocean Currents |
-|---|---|
-| ![Wind](screenshots/wind.png) | ![Currents](screenshots/currents.png) |
+### Ocean Currents
+![Ocean Currents](screenshots/current.png)
 
-| Temperature | Tectonic Plates |
-|---|---|
-| ![Temperature](screenshots/temperature.png) | ![Plates](screenshots/plates.png) |
+### Precipitation
+![Precipitation](screenshots/percipitation.png)
+
+### Atmosphere with Sun Orbit Guide
+![Atmosphere with Sun Orbit](screenshots/atmo+sunorbit.png)
+
+### Control Panel
+![Control Panel](screenshots/atmo+ui.png)
 
 ---
 
@@ -49,4 +56,4 @@ make
 - **Scroll** — zoom
 - **F1** — show or hide the control panel
 - **A / C / W / Space** — atmosphere, plate view, weather, tectonics pause
-- **Tab / 1-0 / E / R** — cycle or jump to weather visualization modes
+- **Tab / 1-0 / E / R / B** — cycle or jump to weather visualization modes
