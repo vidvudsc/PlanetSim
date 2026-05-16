@@ -31,6 +31,16 @@
 #define ATMOSPHERE_SCATTERING_STRENGTH 24.0f
 #define MAX_TILE_NEIGHBORS 8
 #define FLOW_ARROW_SEGMENTS 5
+#define WEATHER_MIN_TEMP_C -45.0f
+#define WEATHER_MAX_TEMP_C 45.0f
+#define WEATHER_PRESSURE_MIN_HPA 540.0f
+#define WEATHER_PRESSURE_MAX_HPA 1065.0f
+#define WEATHER_SEA_LEVEL_PRESSURE_HPA 1013.25f
+#define WEATHER_TERRAIN_ALTITUDE_RANGE_M 7200.0f
+#define WEATHER_TROPO_LAPSE_C_PER_KM 6.5f
+#define WEATHER_ATMOSPHERE_SCALE_HEIGHT_M 8400.0f
+#define CLIMATE_CHART_BINS 96
+#define CLIMATE_CHART_SAMPLE_CAP 48.0f
 
 typedef struct OrbitCamera {
     float yaw;
@@ -138,6 +148,14 @@ typedef struct WeatherCell {
     float recentRain;
     float rainShadow;
     float orographicLift;
+    float pressureAnomaly;
+    float frontStrength;
+    float airMassAge;
+    float climateTemperature;
+    float climatePrecipitation;
+    float climateSoilMoisture;
+    float seasonalTemperatureMin;
+    float seasonalTemperatureMax;
 } WeatherCell;
 
 typedef struct ClimateSettings {
@@ -146,6 +164,7 @@ typedef struct ClimateSettings {
     bool dayNightEnabled;
     bool seasonsEnabled;
     bool showSunOrbit;
+    bool showTiltAxis;
     float dayPhase;
     float yearPhase;
     float daySpeed;
@@ -167,6 +186,51 @@ typedef struct SolarState {
     Vector3 lightDir;
     float declination;
 } SolarState;
+
+typedef struct WeatherForcing {
+    float latAbs;
+    float climateLat;
+    float planetaryWave;
+    float moistureWave;
+    float eddyWave;
+    float synopticWave;
+    float equatorHeat;
+    float itcz;
+    float subtropicalHigh;
+    float stormTrack;
+    float polarHigh;
+    float westerly;
+    float trade;
+    float polar;
+    Vector3 east;
+    Vector3 north;
+} WeatherForcing;
+
+typedef struct WeatherTerrain {
+    float elevationMeters;
+    float altitudeKm;
+    float oceanDepthKm;
+    float land;
+    float ocean;
+    float coast;
+    float slope;
+    float roughness;
+    float highland;
+    float mountain;
+    float valley;
+    float exposure;
+} WeatherTerrain;
+
+typedef struct WeatherFlux {
+    float temperature;
+    float pressure;
+    float humidity;
+    float cloudWater;
+    float soilMoisture;
+    float oceanTemperature;
+    Vector3 wind;
+    Vector3 current;
+} WeatherFlux;
 
 typedef struct PanelLayout {
     Rectangle bounds;
@@ -194,12 +258,21 @@ typedef enum WeatherViewMode {
     WEATHER_VIEW_COUNT
 } WeatherViewMode;
 
+typedef struct ClimateChartHistory {
+    float values[WEATHER_VIEW_COUNT][CLIMATE_CHART_BINS];
+    float latest[WEATHER_VIEW_COUNT];
+    float sampleCounts[CLIMATE_CHART_BINS];
+    int lastBin;
+    bool initialized;
+} ClimateChartHistory;
+
 static float SphericalNoise3(Vector3 unitDirection, float scale, Vector3 offset, int octaves, float lacunarity, float gain);
 static float WarpedClimateLatitudeFromAxis(Vector3 unitDirection, Vector3 climateNorth, float equatorShift, float strength);
 static Vector3 TangentEast(Vector3 normal);
 static Vector3 TangentEastFromAxis(Vector3 normal, Vector3 climateNorth);
 static Vector3 TangentNorthFromAxis(Vector3 normal, Vector3 climateNorth);
 static Vector3 ClimateEddyFlowFromAxis(Vector3 normal, Vector3 climateNorth, float scale, Vector3 offset, float strength);
+static float MaxSurfaceRadius(const Tile *tiles, int tileCount);
 
 static float ClampFloat(float value, float minValue, float maxValue)
 {
@@ -320,18 +393,29 @@ static Color ShadeSurfaceColor(Color color, Vector3 normal, float strength)
 
 static float WeatherTemperatureC(float temperature)
 {
-    return LerpFloat(-35.0f, 45.0f, ClampFloat(temperature, 0.0f, 1.0f));
+    return LerpFloat(WEATHER_MIN_TEMP_C, WEATHER_MAX_TEMP_C, ClampFloat(temperature, 0.0f, 1.0f));
+}
+
+static float WeatherTemperature01FromC(float temperatureC)
+{
+    return ClampFloat((temperatureC - WEATHER_MIN_TEMP_C) / (WEATHER_MAX_TEMP_C - WEATHER_MIN_TEMP_C), 0.0f, 1.0f);
 }
 
 static float WeatherPressureHpa(float pressure)
 {
-    float t = ClampFloat((pressure - 0.18f) / 0.70f, 0.0f, 1.0f);
-    return LerpFloat(870.0f, 1090.0f, t);
+    return LerpFloat(WEATHER_PRESSURE_MIN_HPA, WEATHER_PRESSURE_MAX_HPA, ClampFloat(pressure, 0.0f, 1.0f));
+}
+
+static float WeatherPressure01FromHpa(float pressureHpa)
+{
+    return ClampFloat((pressureHpa - WEATHER_PRESSURE_MIN_HPA) / (WEATHER_PRESSURE_MAX_HPA - WEATHER_PRESSURE_MIN_HPA), 0.0f, 1.0f);
 }
 
 static float WeatherSaturation(float temperature)
 {
-    return ClampFloat(0.19f + powf(ClampFloat(temperature, 0.0f, 1.0f), 1.35f) * 0.86f, 0.16f, 1.24f);
+    float temperatureC = WeatherTemperatureC(temperature);
+    float vaporPressure = 6.112f * expf((17.67f * temperatureC) / (temperatureC + 243.5f));
+    return ClampFloat(vaporPressure / 42.0f, 0.08f, 1.35f);
 }
 
 static float WeatherRelativeHumidity(float humidity, float temperature)
@@ -352,6 +436,11 @@ static float WeatherCurrentMetersPerSecond(Vector3 current)
 static float TerrainElevationMeters(float elevation)
 {
     return elevation * 36000.0f;
+}
+
+static float WeatherElevationMeters(float normalizedElevation)
+{
+    return normalizedElevation * WEATHER_TERRAIN_ALTITUDE_RANGE_M;
 }
 
 static float RandomFloat01(void)
@@ -779,10 +868,10 @@ static void RefreshWeatherSurface(WeatherCell *cells, const Tile *tiles, int cou
 {
     for (int i = 0; i < count; i++) {
         Vector3 normal = tiles[i].baseCenterDir;
-        float elevationRaw = tiles[i].elevation * PLANET_RADIUS;
+        float elevationMeters = TerrainElevationMeters(tiles[i].elevation);
         cells[i].normal = normal;
-        cells[i].elevation = ClampFloat(elevationRaw / 0.12f, -1.0f, 1.2f);
-        cells[i].ocean = SmoothStep01((-elevationRaw + 0.010f) / 0.055f);
+        cells[i].elevation = ClampFloat(elevationMeters / WEATHER_TERRAIN_ALTITUDE_RANGE_M, -0.75f, 1.35f);
+        cells[i].ocean = SmoothStep01((-elevationMeters + 140.0f) / 720.0f);
     }
 }
 
@@ -792,60 +881,201 @@ static float GaussianBand(float x, float center, float width)
     return expf(-d * d);
 }
 
+static WeatherForcing BuildWeatherForcing(Vector3 normal, const ClimateSettings *climate, const SolarState *solar)
+{
+    WeatherForcing f = { 0 };
+    f.latAbs = fabsf(Vector3DotProduct(normal, solar->northPole));
+    float equatorShift = ClimateEquatorShift(solar, climate);
+    f.climateLat = WarpedClimateLatitudeFromAxis(normal, solar->northPole, equatorShift, 0.145f);
+    f.planetaryWave = SphericalNoise3(normal, 1.65f, (Vector3){ 23.7f, -18.2f, 9.4f }, 3, 1.92f, 0.54f);
+    f.moistureWave = SphericalNoise3(normal, 4.35f, (Vector3){ -42.1f, 7.8f, 31.6f }, 3, 2.07f, 0.52f);
+    f.eddyWave = SphericalNoise3(normal, 7.8f, (Vector3){ 15.2f, 51.4f, -22.7f }, 2, 2.16f, 0.48f);
+
+    Vector3 driftingNormal = RotateAroundAxis(normal, solar->northPole, climate->dayPhase * -2.4f + climate->yearPhase * 0.9f);
+    f.synopticWave = SphericalNoise3(driftingNormal, 2.35f, (Vector3){ 81.2f, -12.6f, 43.5f }, 4, 2.0f, 0.53f);
+    f.equatorHeat = ClampFloat(ClimateInsolation(normal, solar, climate) + (f.planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
+
+    f.westerly = GaussianBand(f.climateLat, 0.45f, 0.17f);
+    f.trade = GaussianBand(f.climateLat, 0.20f, 0.14f);
+    f.polar = GaussianBand(f.climateLat, 0.78f, 0.11f);
+    f.itcz = GaussianBand(f.climateLat, 0.04f, 0.17f) * LerpFloat(0.84f, 1.12f, f.moistureWave);
+    f.subtropicalHigh = GaussianBand(f.climateLat, 0.31f, 0.13f);
+    f.stormTrack = GaussianBand(f.climateLat, 0.55f, 0.22f) * LerpFloat(0.86f, 1.08f, f.planetaryWave);
+    f.polarHigh = GaussianBand(f.climateLat, 0.91f, 0.16f);
+    f.east = TangentEastFromAxis(normal, solar->northPole);
+    f.north = TangentNorthFromAxis(normal, solar->northPole);
+    return f;
+}
+
+static Vector3 LimitTangentVector(Vector3 value, Vector3 normal, float maxLength)
+{
+    value = Vector3Subtract(value, Vector3Scale(normal, Vector3DotProduct(value, normal)));
+    float len = Vector3Length(value);
+    if (len > maxLength && len > 0.000001f) value = Vector3Scale(value, maxLength / len);
+    return value;
+}
+
+static WeatherTerrain BuildWeatherTerrain(const WeatherCell *cell, float terrainSlope, float coastalContrast, float elevationAvg)
+{
+    WeatherTerrain t = { 0 };
+    t.elevationMeters = WeatherElevationMeters(cell->elevation);
+    t.altitudeKm = fmaxf(t.elevationMeters, 0.0f) * 0.001f;
+    t.oceanDepthKm = fmaxf(-t.elevationMeters, 0.0f) * 0.001f;
+    t.ocean = ClampFloat(cell->ocean, 0.0f, 1.0f);
+    t.land = 1.0f - t.ocean;
+    t.coast = ClampFloat(coastalContrast * (0.40f + 0.60f * (1.0f - fabsf(t.ocean - 0.5f) * 2.0f)), 0.0f, 1.0f);
+    t.slope = ClampFloat(terrainSlope, 0.0f, 1.0f);
+    t.highland = t.land * SmoothStep01((t.altitudeKm - 0.75f) / 2.25f);
+    t.mountain = t.land * SmoothStep01((t.altitudeKm - 1.60f) / 3.60f);
+    t.valley = t.land * SmoothStep01((elevationAvg - cell->elevation + 0.035f) / 0.20f) * SmoothStep01((0.62f - cell->elevation) / 0.80f);
+    t.roughness = t.land * ClampFloat(0.20f + t.slope * 1.08f + t.highland * 0.20f + t.mountain * 0.30f + cell->snow * 0.08f, 0.0f, 1.0f);
+    t.exposure = ClampFloat(t.slope * (0.58f + t.mountain * 0.46f) + t.coast * 0.22f + t.highland * 0.14f, 0.0f, 1.0f);
+    return t;
+}
+
+static float TerrainPressureFactor(float altitudeKm)
+{
+    return expf(-(altitudeKm * 1000.0f) / WEATHER_ATMOSPHERE_SCALE_HEIGHT_M);
+}
+
+static void AddSymmetricScalarFlux(float *a, float *b, float transfer)
+{
+    *a -= transfer;
+    *b += transfer;
+}
+
+static void AddSymmetricVectorFlux(Vector3 *a, Vector3 *b, Vector3 transfer)
+{
+    *a = Vector3Subtract(*a, transfer);
+    *b = Vector3Add(*b, transfer);
+}
+
+static void AccumulateWeatherFluxes(const TileGraphNode *graph, const WeatherCell *src, WeatherFlux *fluxes, int count, float dt)
+{
+    for (int i = 0; i < count; i++) {
+        const WeatherCell *a = &src[i];
+        const TileGraphNode *node = &graph[i];
+
+        for (int n = 0; n < node->neighborCount; n++) {
+            int nb = node->neighbors[n];
+            if (nb <= i) continue;
+
+            const WeatherCell *b = &src[nb];
+            Vector3 edge = Vector3Subtract(b->normal, Vector3Scale(a->normal, Vector3DotProduct(b->normal, a->normal)));
+            float edgeLen = Vector3Length(edge);
+            if (edgeLen < 0.000001f) continue;
+            edge = Vector3Scale(edge, 1.0f / edgeLen);
+
+            Vector3 airTransport = Vector3Scale(Vector3Add(a->wind, b->wind), 0.5f);
+            Vector3 seaTransport = Vector3Scale(Vector3Add(a->current, b->current), 0.5f);
+            float airFlow = Vector3DotProduct(airTransport, edge);
+            float seaFlow = Vector3DotProduct(seaTransport, edge);
+            float landA = 1.0f - a->ocean;
+            float landB = 1.0f - b->ocean;
+            float oceanGate = fminf(a->ocean, b->ocean);
+            float landGate = fminf(landA, landB);
+            float elevationJump = fabsf(b->elevation - a->elevation);
+            float mountainBarrier = SmoothStep01((elevationJump - 0.10f) / 0.34f) * landGate;
+            float coastMixing = fabsf(a->ocean - b->ocean);
+            float airConductance = (1.0f - mountainBarrier * 0.68f) * (1.0f + coastMixing * 0.16f);
+            float oceanConductance = oceanGate * (1.0f - coastMixing * 0.45f);
+
+            float airAdvection = ClampFloat(fabsf(airFlow) * 10.5f * dt * airConductance, 0.0f, 0.24f);
+            float airDiffusion = (0.018f + 0.026f * (1.0f - mountainBarrier)) * dt;
+            float oceanAdvection = ClampFloat(fabsf(seaFlow) * 9.0f * dt * oceanConductance, 0.0f, 0.18f);
+            float oceanDiffusion = (0.010f + 0.022f * oceanConductance) * dt;
+
+            float temperatureTransfer = (airFlow >= 0.0f)
+                ? (a->temperature - b->temperature) * airAdvection
+                : (a->temperature - b->temperature) * airAdvection;
+            temperatureTransfer += (a->temperature - b->temperature) * airDiffusion;
+            AddSymmetricScalarFlux(&fluxes[i].temperature, &fluxes[nb].temperature, temperatureTransfer);
+
+            float pressureTransfer = (a->pressure - b->pressure) * (airDiffusion * 0.60f + airAdvection * 0.20f);
+            AddSymmetricScalarFlux(&fluxes[i].pressure, &fluxes[nb].pressure, pressureTransfer);
+
+            float humidityTransfer = (a->humidity - b->humidity) * (airDiffusion * 0.82f + airAdvection * 0.72f);
+            float cloudTransfer = (a->cloudWater - b->cloudWater) * (airDiffusion * 0.68f + airAdvection * 0.52f);
+            AddSymmetricScalarFlux(&fluxes[i].humidity, &fluxes[nb].humidity, humidityTransfer);
+            AddSymmetricScalarFlux(&fluxes[i].cloudWater, &fluxes[nb].cloudWater, cloudTransfer);
+
+            Vector3 windTransfer = Vector3Scale(Vector3Subtract(a->wind, b->wind), airAdvection * 0.34f + airDiffusion * 0.42f);
+            AddSymmetricVectorFlux(&fluxes[i].wind, &fluxes[nb].wind, windTransfer);
+
+            float oceanHeatTransfer = (a->oceanTemperature - b->oceanTemperature) * (oceanDiffusion + oceanAdvection);
+            AddSymmetricScalarFlux(&fluxes[i].oceanTemperature, &fluxes[nb].oceanTemperature, oceanHeatTransfer);
+            Vector3 currentTransfer = Vector3Scale(Vector3Subtract(a->current, b->current), oceanAdvection * 0.42f + oceanDiffusion * 0.36f);
+            AddSymmetricVectorFlux(&fluxes[i].current, &fluxes[nb].current, currentTransfer);
+
+            float downhillAB = fmaxf(0.0f, a->elevation - b->elevation);
+            float downhillBA = fmaxf(0.0f, b->elevation - a->elevation);
+            float soilExchange = (a->soilMoisture - b->soilMoisture) * (0.010f * dt * landGate);
+            soilExchange += a->soilMoisture * downhillAB * 0.060f * dt * landGate;
+            soilExchange -= b->soilMoisture * downhillBA * 0.060f * dt * landGate;
+            AddSymmetricScalarFlux(&fluxes[i].soilMoisture, &fluxes[nb].soilMoisture, soilExchange);
+        }
+    }
+}
+
 static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count, const ClimateSettings *climate, const SolarState *solar)
 {
     RefreshWeatherSurface(cells, tiles, count);
     for (int i = 0; i < count; i++) {
-        float latAbs = fabsf(Vector3DotProduct(cells[i].normal, solar->northPole));
-        float climateLat = WarpedClimateLatitudeFromAxis(cells[i].normal, solar->northPole, ClimateEquatorShift(solar, climate), 0.145f);
-        float planetaryWave = SphericalNoise3(cells[i].normal, 1.65f, (Vector3){ 23.7f, -18.2f, 9.4f }, 3, 1.92f, 0.54f);
-        float moistureWave = SphericalNoise3(cells[i].normal, 4.35f, (Vector3){ -42.1f, 7.8f, 31.6f }, 3, 2.07f, 0.52f);
-        float eddyWave = SphericalNoise3(cells[i].normal, 7.8f, (Vector3){ 15.2f, 51.4f, -22.7f }, 2, 2.16f, 0.48f);
+        WeatherForcing forcing = BuildWeatherForcing(cells[i].normal, climate, solar);
         float pressureSeed = SphericalNoise3(cells[i].normal, 2.85f, (Vector3){ 88.1f, -34.6f, 12.5f }, 3, 2.04f, 0.52f);
-        float equatorHeat = ClampFloat(ClimateInsolation(cells[i].normal, solar, climate) + (planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
-        float westerly = GaussianBand(climateLat, 0.45f, 0.17f);
-        float trade = GaussianBand(climateLat, 0.20f, 0.14f);
-        float polar = GaussianBand(climateLat, 0.78f, 0.11f);
-        float itcz = GaussianBand(climateLat, 0.04f, 0.22f) * LerpFloat(0.62f, 1.18f, moistureWave);
-        float subtropicalHigh = GaussianBand(climateLat, 0.31f, 0.15f);
-        float stormTrack = GaussianBand(climateLat, 0.55f, 0.22f) * LerpFloat(0.70f, 1.16f, planetaryWave);
-        float polarHigh = GaussianBand(climateLat, 0.91f, 0.16f);
+        float initializationItcz = GaussianBand(forcing.climateLat, 0.04f, 0.22f) * LerpFloat(0.62f, 1.18f, forcing.moistureWave);
+        float initializationHigh = GaussianBand(forcing.climateLat, 0.31f, 0.15f);
+        float initializationStormTrack = GaussianBand(forcing.climateLat, 0.55f, 0.22f) * LerpFloat(0.70f, 1.16f, forcing.planetaryWave);
 
-        float land = 1.0f - cells[i].ocean;
-        cells[i].temperature = ClampFloat(0.08f + 0.88f * powf(equatorHeat, 0.86f) + land * (equatorHeat - 0.45f) * 0.070f + cells[i].ocean * 0.020f - fmaxf(cells[i].elevation, 0.0f) * 0.34f - fmaxf(-cells[i].elevation, 0.0f) * 0.025f, 0.0f, 1.0f);
-        cells[i].pressure = ClampFloat(0.56f - itcz * 0.018f + subtropicalHigh * 0.024f - stormTrack * 0.018f + polarHigh * 0.015f + (pressureSeed - 0.5f) * 0.035f - land * (cells[i].temperature - 0.50f) * 0.075f - fmaxf(cells[i].elevation, 0.0f) * 0.060f, 0.18f, 0.88f);
-        cells[i].humidity = ClampFloat(0.19f + cells[i].ocean * 0.54f + itcz * 0.060f + stormTrack * 0.040f + (moistureWave - 0.5f) * 0.060f - subtropicalHigh * 0.050f + cells[i].temperature * 0.08f - fmaxf(cells[i].elevation, 0.0f) * 0.11f, 0.0f, 1.2f);
-        cells[i].cloud = ClampFloat(0.05f + itcz * 0.065f + stormTrack * 0.060f + cells[i].humidity * 0.18f + (moistureWave - 0.5f) * 0.055f - subtropicalHigh * 0.040f + fmaxf(cells[i].elevation, 0.0f) * 0.05f, 0.0f, 1.0f);
+        WeatherTerrain terrain = BuildWeatherTerrain(&cells[i], 0.0f, 0.0f, cells[i].elevation);
+        float seaLevelTemperatureC = LerpFloat(-28.0f, 32.0f, powf(forcing.equatorHeat, 0.82f));
+        seaLevelTemperatureC += terrain.land * (forcing.equatorHeat - 0.48f) * 8.0f;
+        seaLevelTemperatureC += terrain.ocean * 1.8f - terrain.oceanDepthKm * 0.25f;
+        float temperatureC = seaLevelTemperatureC - terrain.altitudeKm * WEATHER_TROPO_LAPSE_C_PER_KM - terrain.highland * 2.5f;
+        cells[i].temperature = WeatherTemperature01FromC(temperatureC);
+        cells[i].pressureAnomaly = (forcing.synopticWave - 0.5f) * 0.060f + (pressureSeed - 0.5f) * 0.030f;
+        float seaLevelPressureHpa = WEATHER_SEA_LEVEL_PRESSURE_HPA - initializationItcz * 11.0f + initializationHigh * 15.0f - initializationStormTrack * 9.0f + forcing.polarHigh * 7.0f + cells[i].pressureAnomaly * 170.0f;
+        seaLevelPressureHpa -= terrain.land * (temperatureC - 13.0f) * 0.85f;
+        float pressureHpa = seaLevelPressureHpa * TerrainPressureFactor(terrain.altitudeKm);
+        cells[i].pressure = WeatherPressure01FromHpa(pressureHpa);
+        float saturation = WeatherSaturation(cells[i].temperature);
+        float relativeHumidity = ClampFloat(0.38f + terrain.ocean * 0.48f + initializationItcz * 0.16f + initializationStormTrack * 0.12f + terrain.coast * 0.10f + (forcing.moistureWave - 0.5f) * 0.14f - initializationHigh * 0.16f - terrain.altitudeKm * 0.035f, 0.10f, 1.05f);
+        cells[i].humidity = ClampFloat(relativeHumidity * saturation, 0.0f, 1.35f);
+        cells[i].cloud = ClampFloat(0.03f + initializationItcz * 0.10f + initializationStormTrack * 0.09f + WeatherRelativeHumidity(cells[i].humidity, cells[i].temperature) * 0.22f + (forcing.moistureWave - 0.5f) * 0.06f - initializationHigh * 0.06f + terrain.mountain * 0.08f, 0.0f, 1.0f);
         cells[i].precipitation = 0.0f;
         cells[i].vorticity = 0.0f;
         cells[i].evaporation = 0.0f;
         float mountainSnow = SmoothStep01((cells[i].elevation - 0.58f) / 0.44f) * SmoothStep01((0.52f - cells[i].temperature) / 0.24f);
-        cells[i].snow = ClampFloat((GaussianBand(latAbs, 0.92f, 0.22f) + mountainSnow * 0.75f) * (1.0f - cells[i].ocean * 0.55f) * SmoothStep01((0.42f - cells[i].temperature) / 0.30f), 0.0f, 1.0f);
+        cells[i].snow = ClampFloat((GaussianBand(forcing.latAbs, 0.92f, 0.22f) + mountainSnow * 0.75f) * (1.0f - cells[i].ocean * 0.55f) * SmoothStep01((0.42f - cells[i].temperature) / 0.30f), 0.0f, 1.0f);
         cells[i].storm = 0.0f;
         cells[i].surfaceTemperature = cells[i].temperature;
         cells[i].oceanTemperature = cells[i].temperature;
-        cells[i].soilMoisture = ClampFloat((1.0f - cells[i].ocean) * (0.10f + cells[i].humidity * 0.32f + stormTrack * 0.10f - subtropicalHigh * 0.08f - fmaxf(cells[i].elevation, 0.0f) * 0.08f), 0.0f, 1.0f);
+        cells[i].soilMoisture = ClampFloat(terrain.land * (0.08f + relativeHumidity * 0.34f + initializationStormTrack * 0.14f + terrain.coast * 0.10f - initializationHigh * 0.11f - terrain.altitudeKm * 0.025f), 0.0f, 1.0f);
         cells[i].cloudWater = cells[i].cloud * 0.35f;
         cells[i].recentRain = 0.0f;
         cells[i].rainShadow = 0.0f;
         cells[i].orographicLift = 0.0f;
+        cells[i].frontStrength = 0.0f;
+        cells[i].airMassAge = RandomRange(0.0f, 1.0f);
+        cells[i].climateTemperature = cells[i].temperature;
+        cells[i].climatePrecipitation = 0.0f;
+        cells[i].climateSoilMoisture = cells[i].soilMoisture;
+        cells[i].seasonalTemperatureMin = cells[i].temperature;
+        cells[i].seasonalTemperatureMax = cells[i].temperature;
 
-        Vector3 east = TangentEastFromAxis(cells[i].normal, solar->northPole);
-        Vector3 north = TangentNorthFromAxis(cells[i].normal, solar->northPole);
-
-        float zonal = (0.088f * westerly - 0.066f * trade - 0.035f * polar) * LerpFloat(0.64f, 1.10f, planetaryWave) * 0.62f;
-        float meridional = ((planetaryWave - 0.5f) * 0.052f + (eddyWave - 0.5f) * 0.034f) * (1.0f - latAbs * 0.35f);
+        float zonal = (0.088f * forcing.westerly - 0.066f * forcing.trade - 0.035f * forcing.polar) * LerpFloat(0.64f, 1.10f, forcing.planetaryWave) * 0.62f;
+        float meridional = ((forcing.planetaryWave - 0.5f) * 0.052f + (forcing.eddyWave - 0.5f) * 0.034f) * (1.0f - forcing.latAbs * 0.35f);
         Vector3 windEddy = ClimateEddyFlowFromAxis(cells[i].normal, solar->northPole, 3.4f, (Vector3){ -8.7f, 61.4f, 25.1f }, 0.010f);
         cells[i].wind = Vector3Add(
-            Vector3Add(Vector3Add(Vector3Scale(east, zonal), Vector3Scale(north, meridional)), windEddy),
+            Vector3Add(Vector3Add(Vector3Scale(forcing.east, zonal), Vector3Scale(forcing.north, meridional)), windEddy),
             Vector3Scale(RandomTangentVector(cells[i].normal), RandomRange(-0.006f, 0.006f))
         );
 
         // Initial ocean gyres use latitude bands, with planetary waves to avoid perfectly parallel rings.
-        float oceanJet = (0.052f * westerly - 0.045f * trade - 0.020f * polar) * cells[i].ocean * LerpFloat(0.82f, 1.06f, planetaryWave) * 0.32f;
+        float oceanJet = (0.052f * forcing.westerly - 0.045f * forcing.trade - 0.020f * forcing.polar) * cells[i].ocean * LerpFloat(0.82f, 1.06f, forcing.planetaryWave) * 0.32f;
         Vector3 currentEddy = ClimateEddyFlowFromAxis(cells[i].normal, solar->northPole, 2.6f, (Vector3){ 37.8f, -14.2f, 73.6f }, 0.015f * cells[i].ocean);
         cells[i].current = Vector3Add(
-            Vector3Add(Vector3Add(Vector3Scale(east, oceanJet), Vector3Scale(north, meridional * cells[i].ocean * 0.30f)), currentEddy),
+            Vector3Add(Vector3Add(Vector3Scale(forcing.east, oceanJet), Vector3Scale(forcing.north, meridional * cells[i].ocean * 0.30f)), currentEddy),
             Vector3Scale(RandomTangentVector(cells[i].normal), RandomRange(-0.003f, 0.003f) * cells[i].ocean)
         );
     }
@@ -861,9 +1091,14 @@ static void StepWeatherSimulation(
     const SolarState *solar
 )
 {
+    WeatherFlux *fluxes = (WeatherFlux *)calloc((size_t)count, sizeof(WeatherFlux));
+    if (fluxes) AccumulateWeatherFluxes(graph, src, fluxes, count, dt);
+    const WeatherFlux zeroFlux = { 0 };
+
     for (int i = 0; i < count; i++) {
         const WeatherCell *c = &src[i];
         const TileGraphNode *node = &graph[i];
+        const WeatherFlux *flux = fluxes ? &fluxes[i] : &zeroFlux;
 
         float tempAvg = c->temperature;
         float humidAvg = c->humidity;
@@ -881,6 +1116,8 @@ static void StepWeatherSimulation(
         float divergence = 0.0f;
         float vorticity = 0.0f;
         float orographic = 0.0f;
+        float frontContrast = 0.0f;
+        float frontWeight = 0.0f;
         float oceanAvg = c->ocean;
         float elevationAvg = c->elevation;
         float coastalContrast = 0.0f;
@@ -888,6 +1125,7 @@ static void StepWeatherSimulation(
         float upwindOceanWeight = 1.0f;
         Vector3 transportLocal = Vector3Add(c->wind, Vector3Scale(c->current, 0.85f));
 
+        // Transport pass: sample mostly from upwind cells, with a small diffusion floor.
         for (int n = 0; n < node->neighborCount; n++) {
             int nb = node->neighbors[n];
             const WeatherCell *k = &src[nb];
@@ -897,7 +1135,9 @@ static void StepWeatherSimulation(
             toNb = Vector3Scale(toNb, 1.0f / toNbLen);
 
             float flow = Vector3DotProduct(transportLocal, toNb);
-            float upwindWeight = 1.0f + fmaxf(0.0f, -flow * 2.6f);
+            float inflow = fmaxf(0.0f, -flow);
+            float outflow = fmaxf(0.0f, flow);
+            float upwindWeight = 0.18f + inflow * 24.0f;
 
             tempAvg += k->temperature * upwindWeight;
             humidAvg += k->humidity * upwindWeight;
@@ -924,9 +1164,14 @@ static void StepWeatherSimulation(
 
             float rise = k->elevation - c->elevation;
             if (rise > 0.0f && flow > 0.0f) orographic += rise * flow;
-            float inflow = fmaxf(0.0f, -flow);
             upwindOcean += k->ocean * inflow;
             upwindOceanWeight += inflow;
+
+            float thermalContrast = fabsf(k->temperature - c->temperature);
+            float moistureContrast = fabsf(WeatherRelativeHumidity(k->humidity, k->temperature) - WeatherRelativeHumidity(c->humidity, c->temperature));
+            float boundaryFlow = inflow + outflow * 0.35f;
+            frontContrast += (thermalContrast * 1.35f + moistureContrast * 0.38f) * boundaryFlow;
+            frontWeight += boundaryFlow;
         }
 
         float invWeight = 1.0f / scalarWeight;
@@ -950,93 +1195,97 @@ static void StepWeatherSimulation(
         upwindOcean = ClampFloat(upwindOcean / upwindOceanWeight, 0.0f, 1.0f);
         oceanTempAvg /= oceanTempWeight;
         float terrainSlope = ClampFloat(Vector3Length(terrainGradient), 0.0f, 1.0f);
+        float incomingFront = (frontWeight > 0.000001f) ? ClampFloat(frontContrast / frontWeight * 6.5f, 0.0f, 1.0f) : 0.0f;
 
-        float latAbs = fabsf(Vector3DotProduct(c->normal, solar->northPole));
-        float equatorShift = ClimateEquatorShift(solar, climate);
-        float climateLat = WarpedClimateLatitudeFromAxis(c->normal, solar->northPole, equatorShift, 0.145f);
-        float planetaryWave = SphericalNoise3(c->normal, 1.65f, (Vector3){ 23.7f, -18.2f, 9.4f }, 3, 1.92f, 0.54f);
-        float moistureWave = SphericalNoise3(c->normal, 4.35f, (Vector3){ -42.1f, 7.8f, 31.6f }, 3, 2.07f, 0.52f);
-        float eddyWave = SphericalNoise3(c->normal, 7.8f, (Vector3){ 15.2f, 51.4f, -22.7f }, 2, 2.16f, 0.48f);
-        float equatorHeat = ClampFloat(ClimateInsolation(c->normal, solar, climate) + (planetaryWave - 0.5f) * 0.045f, 0.0f, 1.0f);
-        float itcz = GaussianBand(climateLat, 0.04f, 0.17f) * LerpFloat(0.84f, 1.12f, moistureWave);
-        float subtropicalHigh = GaussianBand(climateLat, 0.31f, 0.13f);
-        float stormTrack = GaussianBand(climateLat, 0.55f, 0.22f) * LerpFloat(0.86f, 1.08f, planetaryWave);
-        float polarHigh = GaussianBand(climateLat, 0.91f, 0.16f);
+        WeatherForcing forcing = BuildWeatherForcing(c->normal, climate, solar);
         float convergence = ClampFloat(-divergence * 1.8f, 0.0f, 1.0f);
         Vector3 transport = Vector3Add(c->wind, Vector3Scale(c->current, 0.85f));
         float advection = ClampFloat(Vector3Length(transport) * 4.2f, 0.0f, 1.0f);
-        float land = 1.0f - c->ocean;
-        float albedo = ClampFloat(0.07f * c->ocean + 0.23f * land + 0.34f * c->snow + 0.12f * c->cloud, 0.0f, 0.75f);
-        float lapseCooling = fmaxf(c->elevation, 0.0f) * 0.38f + fmaxf(c->elevation - 0.55f, 0.0f) * 0.22f + fmaxf(-c->elevation, 0.0f) * 0.025f;
-        float landHeating = land * (equatorHeat - 0.45f) * (0.090f * climate->temperatureContrast);
-        float marineModeration = c->ocean * (0.50f - c->temperature) * 0.055f;
-        float terrainCooling = fmaxf(elevationAvg, 0.0f) * 0.070f;
-        float temperatureTarget = ClampFloat(0.08f + 0.88f * powf(equatorHeat, 0.86f) + landHeating + marineModeration - lapseCooling - terrainCooling - albedo * 0.16f + c->humidity * 0.015f, 0.0f, 1.0f);
-        float basePressure = 0.56f - itcz * 0.025f + subtropicalHigh * 0.032f - stormTrack * 0.018f + polarHigh * 0.015f;
-        float thermalLow = land * (temperatureTarget - 0.50f) * 0.110f;
-        float terrainLow = fmaxf(c->elevation, 0.0f) * 0.060f + terrainSlope * land * 0.020f;
-        float coastalBreezePressure = coastalContrast * (c->ocean - oceanAvg) * 0.050f;
-        float pressureTarget = basePressure - thermalLow - c->humidity * 0.015f - terrainLow + coastalBreezePressure;
+        WeatherTerrain terrain = BuildWeatherTerrain(c, terrainSlope, coastalContrast, elevationAvg);
+        float land = terrain.land;
+        float signedClimateLatitude = Vector3DotProduct(c->normal, solar->northPole);
+        float albedo = ClampFloat(0.06f * terrain.ocean + 0.21f * land + 0.48f * c->snow + 0.18f * c->cloud, 0.0f, 0.82f);
+        float seaLevelTemperatureC = LerpFloat(-31.0f, 34.0f, powf(forcing.equatorHeat, 0.80f));
+        seaLevelTemperatureC += land * (forcing.equatorHeat - 0.46f) * (10.0f * climate->temperatureContrast);
+        seaLevelTemperatureC += terrain.ocean * (WeatherTemperatureC(c->oceanTemperature) - seaLevelTemperatureC) * 0.18f;
+        seaLevelTemperatureC += terrain.coast * (WeatherTemperatureC(c->oceanTemperature) - seaLevelTemperatureC) * 0.08f;
+        seaLevelTemperatureC -= albedo * 10.5f;
+        seaLevelTemperatureC += WeatherRelativeHumidity(c->humidity, c->temperature) * 1.6f;
+        seaLevelTemperatureC -= terrain.mountain * 2.3f;
+        float temperatureTargetC = seaLevelTemperatureC - terrain.altitudeKm * WEATHER_TROPO_LAPSE_C_PER_KM;
+        float synopticTarget = (forcing.synopticWave - 0.5f) * (0.055f + forcing.stormTrack * 0.045f) - convergence * 0.018f + forcing.subtropicalHigh * 0.010f;
+        float pressureAnomaly = c->pressureAnomaly + (synopticTarget - c->pressureAnomaly) * (0.10f + forcing.stormTrack * 0.10f) * dt;
+        pressureAnomaly = ClampFloat(pressureAnomaly, -0.105f, 0.105f);
+        float seaLevelPressureHpa = WEATHER_SEA_LEVEL_PRESSURE_HPA - forcing.itcz * 14.0f + forcing.subtropicalHigh * 19.0f - forcing.stormTrack * 10.0f + forcing.polarHigh * 8.0f + pressureAnomaly * 185.0f;
+        float thermalLowHpa = land * fmaxf(temperatureTargetC - 14.0f, -10.0f) * 0.82f;
+        float humidityLowHpa = WeatherRelativeHumidity(c->humidity, c->temperature) * 4.5f;
+        float leeTroughHpa = terrain.exposure * land * 5.0f;
+        float coastalBreezeHpa = terrain.coast * (terrain.ocean - oceanAvg) * 10.0f;
+        float pressureTargetHpa = seaLevelPressureHpa * TerrainPressureFactor(terrain.altitudeKm) - thermalLowHpa - humidityLowHpa - leeTroughHpa + coastalBreezeHpa;
+        float pressureTarget = WeatherPressure01FromHpa(pressureTargetHpa);
 
+        // Pressure and wind pass: persistent synoptic anomalies ride on the climate bands.
         float pressure = c->pressure;
         pressure += (pressureTarget - pressure) * 0.42f * dt;
         pressure += (pressAvg - pressure) * 0.72f * dt;
+        pressure += flux->pressure;
         pressure -= convergence * 0.045f * dt;
-        pressure = ClampFloat(pressure, 0.18f, 0.88f);
+        pressure = ClampFloat(pressure, 0.04f, 0.96f);
 
-        Vector3 east = TangentEastFromAxis(c->normal, solar->northPole);
-        Vector3 north = TangentNorthFromAxis(c->normal, solar->northPole);
+        Vector3 east = forcing.east;
+        Vector3 north = forcing.north;
         float northLen = Vector3Length(north);
 
-        float westerly = GaussianBand(climateLat, 0.45f, 0.17f);
-        float trade = GaussianBand(climateLat, 0.20f, 0.14f);
-        float polar = GaussianBand(climateLat, 0.78f, 0.11f);
-        float zonalStrength = (0.088f * westerly - 0.066f * trade - 0.035f * polar) * LerpFloat(0.78f, 1.08f, planetaryWave) * 0.52f;
-        float meridionalStrength = ((planetaryWave - 0.5f) * 0.020f + (eddyWave - 0.5f) * 0.015f) * (1.0f - latAbs * 0.35f);
-        Vector3 terrainDownslope = Vector3Scale(terrainGradient, -0.055f * land);
+        float zonalStrength = (0.088f * forcing.westerly - 0.066f * forcing.trade - 0.035f * forcing.polar) * LerpFloat(0.78f, 1.08f, forcing.planetaryWave) * 0.52f;
+        float meridionalStrength = ((forcing.planetaryWave - 0.5f) * 0.020f + (forcing.eddyWave - 0.5f) * 0.015f) * (1.0f - forcing.latAbs * 0.35f);
+        Vector3 terrainDownslope = Vector3Scale(terrainGradient, -0.045f * land * (0.45f + terrain.exposure));
         Vector3 terrainContour = Vector3CrossProduct(c->normal, terrainGradient);
         if (Vector3LengthSqr(terrainContour) > 0.000001f) terrainContour = Vector3Normalize(terrainContour);
         Vector3 terrainSteering = Vector3Add(
             terrainDownslope,
-            Vector3Scale(terrainContour, Vector3DotProduct(c->wind, terrainGradient) * -0.090f * land)
+            Vector3Scale(terrainContour, Vector3DotProduct(c->wind, terrainGradient) * -0.085f * land * (0.45f + terrain.roughness))
         );
-        float valleyChannel = land * SmoothStep01((-c->elevation) / 0.12f) * terrainSlope;
+        float valleyChannel = terrain.valley * terrainSlope;
         Vector3 valleyBoost = Vector3Scale(terrainContour, Vector3DotProduct(c->wind, terrainContour) * valleyChannel * 0.07f);
         Vector3 jet = Vector3Add(Vector3Add(Vector3Add(Vector3Scale(east, zonalStrength), Vector3Scale(north, meridionalStrength)), terrainSteering), valleyBoost);
 
         Vector3 pressureForce = Vector3Scale(pressureGradient, -1.45f);
-        Vector3 coriolis = Vector3Scale(Vector3CrossProduct(c->normal, c->wind), c->normal.y * 0.92f);
+        Vector3 coriolis = Vector3Scale(Vector3CrossProduct(c->normal, c->wind), signedClimateLatitude * 0.92f);
         Vector3 wind = c->wind;
+        wind = Vector3Add(wind, flux->wind);
         wind = Vector3Add(wind, Vector3Scale(Vector3Add(Vector3Add(pressureForce, coriolis), jet), dt));
         wind = Vector3Add(wind, Vector3Scale(Vector3Subtract(windAvg, wind), (0.54f + 0.34f * advection) * dt));
 
-        float surfaceRoughness = land * (0.30f + terrainSlope * 0.72f + fmaxf(c->elevation, 0.0f) * 0.14f + c->snow * 0.08f);
-        float mountainBlocking = land * terrainSlope * SmoothStep01((fabsf(Vector3DotProduct(wind, terrainGradient)) - 0.004f) / 0.030f);
+        float surfaceRoughness = terrain.roughness;
+        float mountainBlocking = terrain.mountain * SmoothStep01((fabsf(Vector3DotProduct(wind, terrainGradient)) - 0.004f) / 0.030f);
         float drag = 0.22f + surfaceRoughness + mountainBlocking * 0.52f + c->cloud * 0.08f;
         wind = Vector3Scale(wind, ClampFloat(1.0f - drag * dt, 0.0f, 1.0f));
         float windLen = Vector3Length(wind);
         if (windLen > 0.18f) wind = Vector3Scale(wind, 0.18f / windLen);
+        wind = LimitTangentVector(wind, c->normal, 0.18f);
 
         // Ocean currents use gyre bands, wind stress, pressure gradient, and Coriolis.
         Vector3 current = c->current;
+        current = Vector3Add(current, flux->current);
         Vector3 gyre = Vector3Add(
             Vector3Add(
-                Vector3Scale(east, (0.052f * westerly - 0.045f * trade - 0.020f * polar) * c->ocean * LerpFloat(0.82f, 1.06f, planetaryWave) * 0.32f),
+                Vector3Scale(east, (0.052f * forcing.westerly - 0.045f * forcing.trade - 0.020f * forcing.polar) * c->ocean * LerpFloat(0.82f, 1.06f, forcing.planetaryWave) * 0.32f),
                 Vector3Scale(north, meridionalStrength * c->ocean * 0.24f)
             ),
             Vector3Scale(terrainGradient, -0.018f * c->ocean)
         );
         Vector3 currentPressureForce = Vector3Scale(pressureGradient, -0.18f * c->ocean);
         Vector3 windStress = Vector3Scale(wind, 0.42f * c->ocean);
-        Vector3 currentCoriolis = Vector3Scale(Vector3CrossProduct(c->normal, current), c->normal.y * 0.45f);
+        Vector3 currentCoriolis = Vector3Scale(Vector3CrossProduct(c->normal, current), signedClimateLatitude * 0.45f);
         current = Vector3Add(current, Vector3Scale(Vector3Add(Vector3Add(currentPressureForce, windStress), currentCoriolis), dt));
         current = Vector3Add(current, Vector3Scale(Vector3Subtract(gyre, current), 0.42f * dt));
         current = Vector3Add(current, Vector3Scale(Vector3Subtract(currentAvg, current), 0.50f * dt));
 
-        float currentDrag = 0.14f + land * 1.05f;
+        float currentDrag = 0.14f + land * 1.05f + terrain.coast * terrain.ocean * 0.18f;
         current = Vector3Scale(current, ClampFloat(1.0f - currentDrag * dt, 0.0f, 1.0f));
         float currentLen = Vector3Length(current);
         if (currentLen > 0.12f) current = Vector3Scale(current, 0.12f / currentLen);
+        current = LimitTangentVector(current, c->normal, 0.12f);
 
         float polewardCurrent = 0.0f;
         if (northLen > 0.000001f) {
@@ -1049,24 +1298,29 @@ static void StepWeatherSimulation(
 
         float upslopeFlow = ClampFloat(Vector3DotProduct(wind, terrainGradient) * 18.0f, 0.0f, 1.0f);
         float downslopeFlow = ClampFloat(-Vector3DotProduct(wind, terrainGradient) * 20.0f, 0.0f, 1.0f);
-        float orographicLift = ClampFloat(orographic * 1.85f + upslopeFlow * 1.25f + terrainSlope * land * 0.20f, 0.0f, 1.0f);
-        float rainShadow = ClampFloat(c->rainShadow * 0.70f + downslopeFlow * 0.78f + terrainSlope * land * 0.14f - upwindOcean * 0.12f - orographicLift * 0.22f, 0.0f, 0.90f);
+        float orographicLift = ClampFloat(orographic * 1.75f + upslopeFlow * (0.90f + terrain.mountain * 0.86f) + terrain.exposure * 0.18f, 0.0f, 1.0f);
+        float rainShadow = ClampFloat(c->rainShadow * 0.64f + downslopeFlow * (0.58f + terrain.mountain * 0.50f) + terrain.exposure * land * 0.10f - upwindOcean * 0.14f - orographicLift * 0.24f, 0.0f, 0.92f);
 
         float surfaceTemperature = c->surfaceTemperature;
-        float coldPool = land * fmaxf(0.0f, -c->elevation) * ClampFloat(1.0f - Vector3Length(c->wind) * 8.0f, 0.0f, 1.0f) * 0.055f;
-        float surfaceTarget = ClampFloat(
-            temperatureTarget + land * (equatorHeat - 0.50f) * (0.060f * climate->temperatureContrast) + daylightHeating * (0.80f + land * 0.35f) - radiativeCooling - c->snow * 0.12f - c->soilMoisture * land * 0.035f + rainShadow * land * 0.050f - coldPool,
-            0.0f,
-            1.0f
-        );
-        float surfaceResponse = LerpFloat(0.20f, 0.80f, land) * (1.0f - c->soilMoisture * land * 0.35f);
+        float coldPoolC = terrain.valley * land * ClampFloat(1.0f - Vector3Length(c->wind) * 8.0f, 0.0f, 1.0f) * 5.0f;
+        float surfaceTargetC = temperatureTargetC;
+        surfaceTargetC += land * (forcing.equatorHeat - 0.50f) * (7.5f * climate->temperatureContrast);
+        surfaceTargetC += daylightHeating * (16.0f + land * 6.0f);
+        surfaceTargetC -= radiativeCooling * 14.0f;
+        surfaceTargetC -= c->snow * 11.0f + c->soilMoisture * land * 3.2f;
+        surfaceTargetC += rainShadow * land * 4.6f;
+        surfaceTargetC -= coldPoolC;
+        float surfaceTarget = WeatherTemperature01FromC(surfaceTargetC);
+        float surfaceResponse = LerpFloat(0.18f, 0.86f, land) * (1.0f - c->soilMoisture * land * 0.35f) * (1.0f + terrain.exposure * 0.18f);
         surfaceTemperature += (surfaceTarget - surfaceTemperature) * surfaceResponse * dt;
         surfaceTemperature = ClampFloat(surfaceTemperature, 0.0f, 1.0f);
 
+        // Surface pass: land reacts quickly, ocean carries heat with much higher inertia.
         float oceanTemperature = c->oceanTemperature;
-        float oceanBase = ClampFloat(0.08f + 0.88f * powf(equatorHeat, 0.86f) + c->ocean * (0.50f - c->temperature) * 0.065f + daylightHeating * 0.22f - radiativeCooling * 0.10f, 0.0f, 1.0f);
-        float upwelling = coastalContrast * (1.0f - upwindOcean) * 0.28f;
-        float oceanTempTarget = ClampFloat(oceanBase - upwelling - fmaxf(-c->elevation, 0.0f) * 0.12f, 0.0f, 1.0f);
+        oceanTemperature += flux->oceanTemperature;
+        float oceanBaseC = LerpFloat(-2.0f, 30.0f, powf(forcing.equatorHeat, 0.88f)) + daylightHeating * 2.8f - radiativeCooling * 1.2f;
+        float upwellingC = terrain.coast * (1.0f - upwindOcean) * (5.5f + terrain.oceanDepthKm * 0.45f);
+        float oceanTempTarget = WeatherTemperature01FromC(oceanBaseC - upwellingC - terrain.oceanDepthKm * 0.35f);
         float oceanInertia = 0.035f * c->ocean;
         float currentAdvection = ClampFloat(Vector3Length(c->current) * 6.0f, 0.0f, 1.0f);
         oceanTemperature += (oceanTempTarget - oceanTemperature) * oceanInertia * dt;
@@ -1076,6 +1330,7 @@ static void StepWeatherSimulation(
 
         float temperature = c->temperature;
         float heatResponse = LerpFloat(0.42f, 0.76f, land);
+        temperature += flux->temperature;
         temperature += (surfaceTemperature - temperature) * heatResponse * dt;
         temperature += (oceanTemperature - temperature) * c->ocean * 0.16f * dt;
         temperature += (tempAvg - temperature) * (0.15f + 0.76f * advection) * dt;
@@ -1084,9 +1339,11 @@ static void StepWeatherSimulation(
         temperature -= c->cloud * 0.018f * dt;
         temperature = ClampFloat(temperature, 0.0f, 1.0f);
 
+        // Water cycle pass: vapor condenses into cloud water, then rains or snows out.
         float humidity = c->humidity;
+        humidity += flux->humidity;
         float saturation = WeatherSaturation(temperature);
-        float coastalMoisture = ClampFloat(oceanAvg * 0.42f + upwindOcean * 0.72f + coastalContrast * 0.30f, 0.0f, 1.0f);
+        float coastalMoisture = ClampFloat(oceanAvg * 0.38f + upwindOcean * 0.78f + terrain.coast * 0.34f, 0.0f, 1.0f);
         float landWetness = ClampFloat(
             c->soilMoisture * 0.62f + c->recentRain * 0.64f + coastalMoisture * 0.20f + c->cloudWater * 0.18f + c->snow * 0.22f,
             0.0f,
@@ -1095,20 +1352,24 @@ static void StepWeatherSimulation(
         float surfaceWetness = ClampFloat(c->ocean + land * landWetness, 0.0f, 1.0f);
         float evaporationSurfaceTemp = LerpFloat(surfaceTemperature, oceanTemperature, c->ocean);
         float humidityDeficit = ClampFloat((saturation - humidity + 0.16f) / 0.84f, 0.0f, 1.0f);
-        float climateHumidity = ClampFloat(0.16f + c->ocean * 0.43f + coastalMoisture * 0.23f + land * c->soilMoisture * 0.28f + itcz * 0.090f + stormTrack * 0.040f - subtropicalHigh * 0.070f + temperature * 0.08f - fmaxf(c->elevation, 0.0f) * 0.085f - rainShadow * 0.30f, 0.0f, 1.18f);
-        float evaporationRate = surfaceWetness * (0.018f + evaporationSurfaceTemp * 0.128f + windLen * 0.24f + land * 0.018f) * humidityDeficit;
+        float climateRelativeHumidity = ClampFloat(0.32f + c->ocean * 0.40f + coastalMoisture * 0.30f + land * c->soilMoisture * 0.30f + forcing.itcz * 0.15f + forcing.stormTrack * 0.08f - forcing.subtropicalHigh * 0.18f - terrain.altitudeKm * 0.030f - rainShadow * 0.33f - c->airMassAge * land * 0.08f, 0.08f, 1.10f);
+        float climateHumidity = ClampFloat(climateRelativeHumidity * saturation, 0.0f, 1.30f);
+        float aerodynamicDrying = 0.55f + windLen * 7.2f + terrain.exposure * 0.34f;
+        float evaporationRate = surfaceWetness * (0.010f + evaporationSurfaceTemp * 0.116f + land * 0.014f) * humidityDeficit * aerodynamicDrying;
         humidity += evaporationRate * dt;
         humidity += (climateHumidity - humidity) * 0.11f * dt;
         humidity += (humidAvg - humidity) * (0.12f + 0.72f * advection) * dt;
-        humidity -= rainShadow * land * 0.090f * dt;
+        humidity -= rainShadow * land * (0.080f + terrain.mountain * 0.045f) * dt;
 
-        float lift = convergence * 0.40f + orographicLift * 1.05f + fabsf(vorticity) * 0.06f;
+        float frontStrength = ClampFloat(c->frontStrength + (incomingFront - c->frontStrength) * (0.48f + advection * 0.70f) * dt, 0.0f, 1.0f);
+        float lift = convergence * 0.40f + orographicLift * 1.05f + fabsf(vorticity) * 0.06f + frontStrength * (0.20f + forcing.stormTrack * 0.34f);
         float relativeHumidity = ClampFloat(humidity / saturation, 0.0f, 2.0f);
         float condensation = fmaxf(0.0f, humidity - saturation * 0.96f) * (0.80f + 1.40f * lift) * dt;
         condensation += humidity * lift * SmoothStep01((relativeHumidity - 0.58f) / 0.46f) * 0.055f * dt;
         humidity -= condensation;
 
         float cloudWater = c->cloudWater;
+        cloudWater += flux->cloudWater;
         cloudWater += condensation * 1.20f;
         cloudWater += (cloudWaterAvg - cloudWater) * (0.18f + advection * 0.36f) * dt;
         cloudWater -= rainShadow * land * 0.040f * dt;
@@ -1116,12 +1377,13 @@ static void StepWeatherSimulation(
 
         float cloud = c->cloud;
         float terrainCloud = land * c->soilMoisture * SmoothStep01((relativeHumidity - 0.40f) / 0.45f);
-        float cloudTarget = ClampFloat(SmoothStep01(cloudWater / 0.34f) * 0.72f + (relativeHumidity - 0.58f) * 0.42f + lift * 0.28f + terrainCloud * 0.20f + coastalMoisture * 0.06f - rainShadow * 0.16f, 0.0f, 1.0f);
+        float capCloud = terrain.mountain * SmoothStep01((relativeHumidity - 0.52f) / 0.34f) * (0.35f + upslopeFlow * 0.65f);
+        float cloudTarget = ClampFloat(SmoothStep01(cloudWater / 0.34f) * 0.72f + (relativeHumidity - 0.58f) * 0.42f + lift * 0.28f + terrainCloud * 0.20f + capCloud * 0.18f + coastalMoisture * 0.06f - rainShadow * 0.18f, 0.0f, 1.0f);
         cloud += (cloudTarget - cloud) * (0.42f + 0.18f * advection) * dt;
         cloud += (cloudAvg - cloud) * 0.18f * dt;
 
-        float storm = ClampFloat(lift * 0.95f + orographicLift * 0.44f + fabsf(vorticity) * 0.50f + convergence * 0.22f + fmaxf(0.0f, relativeHumidity - 0.82f) * 0.88f + cloudWater * 0.28f, 0.0f, 1.0f);
-        float rainRate = cloudWater * (0.030f + 0.46f * storm + 0.14f * convergence + 0.58f * orographicLift + terrainCloud * 0.065f);
+        float storm = ClampFloat(lift * 0.88f + orographicLift * 0.38f + fabsf(vorticity) * 0.42f + convergence * 0.20f + frontStrength * 0.58f + fmaxf(0.0f, relativeHumidity - 0.82f) * 0.80f + cloudWater * 0.25f, 0.0f, 1.0f);
+        float rainRate = cloudWater * (0.020f + 0.38f * storm + 0.13f * convergence + 0.58f * orographicLift + frontStrength * 0.25f + terrainCloud * 0.055f + capCloud * 0.070f);
         float rain = rainRate * dt;
         cloudWater = ClampFloat(cloudWater - rain * 1.55f, 0.0f, 1.20f);
         float coldPrecip = SmoothStep01((0.35f - temperature) / 0.18f);
@@ -1129,12 +1391,13 @@ static void StepWeatherSimulation(
         snow += rain * coldPrecip * (land + c->ocean * 0.35f) * 0.85f;
         snow -= fmaxf(0.0f, temperature - 0.33f) * (0.18f + rain * 0.8f) * dt;
         float mountainSnow = SmoothStep01((c->elevation - 0.58f) / 0.44f) * SmoothStep01((0.52f - temperature) / 0.24f);
-        snow += (GaussianBand(latAbs, 0.94f, 0.16f) + mountainSnow * 0.85f) * coldPrecip * land * 0.010f * dt;
+        snow += (GaussianBand(forcing.latAbs, 0.94f, 0.16f) + mountainSnow * 0.85f) * coldPrecip * land * 0.010f * dt;
         snow = ClampFloat(snow, 0.0f, 1.0f);
 
         float liquidRain = rain * (1.0f - coldPrecip * 0.78f);
-        float runoff = ClampFloat((terrainSlope * 0.95f + c->soilMoisture * 0.35f - 0.12f) * land, 0.0f, 0.65f);
+        float runoff = ClampFloat((terrain.slope * 0.90f + terrain.mountain * 0.22f + c->soilMoisture * 0.35f - 0.12f) * land, 0.0f, 0.68f);
         float soilMoisture = c->soilMoisture;
+        soilMoisture += flux->soilMoisture;
         soilMoisture += liquidRain * land * (4.60f * (1.0f - runoff));
         soilMoisture += fmaxf(0.0f, temperature - 0.36f) * c->snow * land * 0.018f * dt;
         soilMoisture += (soilMoistureAvg - soilMoisture) * 0.055f * dt;
@@ -1152,6 +1415,15 @@ static void StepWeatherSimulation(
         float precipitation = ClampFloat(c->precipitation + (precipitationTarget - c->precipitation) * (0.75f + storm * 1.40f) * dt, 0.0f, 1.0f);
         float evaporation = ClampFloat(c->evaporation + (evaporationRate * 9.0f - c->evaporation) * 0.72f * dt, 0.0f, 1.0f);
         float recentRain = ClampFloat(c->recentRain + (precipitationTarget - c->recentRain) * (0.45f + storm * 1.20f) * dt, 0.0f, 1.0f);
+        // Climate-memory pass: biomes use long-term conditions instead of frame weather.
+        float climateBlend = ClampFloat(0.018f * dt, 0.0001f, 0.018f);
+        float climateTemperature = LerpFloat(c->climateTemperature, temperature, climateBlend);
+        float climatePrecipitation = LerpFloat(c->climatePrecipitation, precipitationTarget, climateBlend);
+        float climateSoilMoisture = LerpFloat(c->climateSoilMoisture, soilMoisture, climateBlend);
+        float seasonalRecovery = ClampFloat(0.010f * dt, 0.0f, 0.010f);
+        float seasonalTemperatureMin = LerpFloat(fminf(c->seasonalTemperatureMin, temperature), climateTemperature, seasonalRecovery);
+        float seasonalTemperatureMax = LerpFloat(fmaxf(c->seasonalTemperatureMax, temperature), climateTemperature, seasonalRecovery);
+        float airMassAge = ClampFloat((c->airMassAge + dt * (0.055f + land * 0.030f)) * (1.0f - (convergence + precipitationTarget) * 0.070f * dt), 0.0f, 1.0f);
 
         dst[i] = *c;
         dst[i].wind = wind;
@@ -1172,7 +1444,17 @@ static void StepWeatherSimulation(
         dst[i].recentRain = recentRain;
         dst[i].rainShadow = rainShadow;
         dst[i].orographicLift = orographicLift;
+        dst[i].pressureAnomaly = pressureAnomaly;
+        dst[i].frontStrength = frontStrength;
+        dst[i].airMassAge = airMassAge;
+        dst[i].climateTemperature = climateTemperature;
+        dst[i].climatePrecipitation = climatePrecipitation;
+        dst[i].climateSoilMoisture = climateSoilMoisture;
+        dst[i].seasonalTemperatureMin = seasonalTemperatureMin;
+        dst[i].seasonalTemperatureMax = seasonalTemperatureMax;
     }
+
+    free(fluxes);
 }
 
 static const unsigned char kPerlinPerm[256] = {
@@ -1727,9 +2009,10 @@ static Color GetBiomeColor(const WeatherCell *w)
         return (Color){ 228, 234, 240, 255 };
     }
 
-    float temp = w->temperature;
-    float precip = fmaxf(w->precipitation, w->recentRain * 0.55f);
-    float moisture = w->soilMoisture * 0.55f + precip * 0.35f + w->humidity * 0.10f;
+    float temp = w->climateTemperature;
+    float seasonalRange = ClampFloat(w->seasonalTemperatureMax - w->seasonalTemperatureMin, 0.0f, 1.0f);
+    float moisture = ClampFloat(w->climateSoilMoisture * 0.58f + w->climatePrecipitation * 0.34f + WeatherRelativeHumidity(w->humidity, w->temperature) * 0.08f, 0.0f, 1.0f);
+    moisture = ClampFloat(moisture - seasonalRange * 0.06f + w->rainShadow * -0.08f, 0.0f, 1.0f);
 
     if (temp < 0.18f) {
         if (moisture < 0.22f) return (Color){ 182, 178, 166, 255 };
@@ -1810,7 +2093,7 @@ static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
             );
         }
         case WEATHER_VIEW_RAIN: {
-            float rain = SmoothStep01(fmaxf(w->precipitation, w->recentRain * 0.55f) / 0.22f);
+            float rain = SmoothStep01(fmaxf(fmaxf(w->precipitation, w->recentRain * 0.55f), w->frontStrength * 0.16f) / 0.22f);
             return Gradient3(
                 rain,
                 (Color){ 34, 47, 63, 255 },
@@ -1828,7 +2111,7 @@ static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
             );
         }
         case WEATHER_VIEW_STORM: {
-            float storm = SmoothStep01((fmaxf(w->storm, w->orographicLift * 0.65f) - 0.04f) / 0.55f);
+            float storm = SmoothStep01((fmaxf(fmaxf(w->storm, w->orographicLift * 0.65f), w->frontStrength * 0.72f) - 0.04f) / 0.55f);
             return Gradient3(
                 storm,
                 (Color){ 36, 42, 56, 255 },
@@ -1885,6 +2168,237 @@ static float WeatherViewOverlayStrength(WeatherViewMode mode)
         default:
             return 0.62f;
     }
+}
+
+static float WeatherIceAmount(const WeatherCell *w)
+{
+    float ocean = ClampFloat(w->ocean, 0.0f, 1.0f);
+    float land = 1.0f - ocean;
+    float oceanTempC = WeatherTemperatureC(w->oceanTemperature);
+    float surfaceTempC = WeatherTemperatureC(w->surfaceTemperature);
+    float seaIce = ocean * ClampFloat(
+        SmoothStep01((-1.8f - oceanTempC) / 7.0f) * 0.72f +
+        SmoothStep01((-8.0f - surfaceTempC) / 16.0f) * 0.42f +
+        w->snow * 0.28f,
+        0.0f,
+        1.0f
+    );
+    float landIce = land * ClampFloat(
+        w->snow * 0.76f +
+        SmoothStep01((-6.0f - surfaceTempC) / 18.0f) * 0.32f +
+        SmoothStep01((w->elevation - 0.45f) / 0.50f) * 0.22f,
+        0.0f,
+        1.0f
+    );
+    return ClampFloat(fmaxf(seaIce, landIce), 0.0f, 1.0f);
+}
+
+static Color WeatherIceColor(const WeatherCell *w)
+{
+    Color glacier = (Color){ 234, 244, 250, 255 };
+    Color seaIce = (Color){ 198, 226, 240, 255 };
+    return LerpColor(glacier, seaIce, ClampFloat(w->ocean, 0.0f, 1.0f));
+}
+
+static float WeatherChartMetricValue(const WeatherCell *w, WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+            return ClampFloat(w->temperature, 0.0f, 1.0f);
+        case WEATHER_VIEW_PRESSURE:
+            return ClampFloat(w->pressure, 0.0f, 1.0f);
+        case WEATHER_VIEW_WIND:
+            return SmoothStep01(Vector3Length(w->wind) / 0.18f);
+        case WEATHER_VIEW_CURRENT:
+            return SmoothStep01(Vector3Length(w->current) / 0.12f);
+        case WEATHER_VIEW_HUMIDITY:
+            return ClampFloat((WeatherRelativeHumidity(w->humidity, w->temperature) - 0.10f) / 1.05f, 0.0f, 1.0f);
+        case WEATHER_VIEW_CLOUD:
+            return ClampFloat(fmaxf(w->cloud, w->cloudWater * 1.15f), 0.0f, 1.0f);
+        case WEATHER_VIEW_RAIN:
+            return SmoothStep01(fmaxf(fmaxf(w->precipitation, w->recentRain * 0.55f), w->frontStrength * 0.16f) / 0.28f);
+        case WEATHER_VIEW_VORTICITY:
+            return ClampFloat(fabsf(w->vorticity), 0.0f, 1.0f);
+        case WEATHER_VIEW_STORM:
+            return ClampFloat(fmaxf(fmaxf(w->storm, w->orographicLift * 0.65f), w->frontStrength * 0.72f), 0.0f, 1.0f);
+        case WEATHER_VIEW_EVAPORATION:
+            return SmoothStep01((w->evaporation + w->soilMoisture * 0.12f) / 0.42f);
+        case WEATHER_VIEW_SNOW:
+            return ClampFloat(w->snow, 0.0f, 1.0f);
+        case WEATHER_VIEW_OCEAN_TEMP:
+            return ClampFloat(w->oceanTemperature, 0.0f, 1.0f);
+        case WEATHER_VIEW_BIOME: {
+            float land = 1.0f - ClampFloat(w->ocean, 0.0f, 1.0f);
+            float moisture = ClampFloat(w->climateSoilMoisture * 0.58f + w->climatePrecipitation * 0.34f, 0.0f, 1.0f);
+            float warmth = SmoothStep01((w->climateTemperature - 0.18f) / 0.62f);
+            return ClampFloat(land * (moisture * 0.62f + warmth * 0.38f), 0.0f, 1.0f);
+        }
+        default:
+            return 0.0f;
+    }
+}
+
+static Color WeatherChartLineColor(WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE: return (Color){ 232, 142, 78, 255 };
+        case WEATHER_VIEW_PRESSURE: return (Color){ 108, 158, 238, 255 };
+        case WEATHER_VIEW_WIND: return (Color){ 236, 232, 170, 255 };
+        case WEATHER_VIEW_CURRENT: return (Color){ 78, 198, 236, 255 };
+        case WEATHER_VIEW_HUMIDITY: return (Color){ 94, 184, 124, 255 };
+        case WEATHER_VIEW_CLOUD: return (Color){ 204, 216, 232, 255 };
+        case WEATHER_VIEW_RAIN: return (Color){ 72, 148, 238, 255 };
+        case WEATHER_VIEW_VORTICITY: return (Color){ 216, 108, 116, 255 };
+        case WEATHER_VIEW_STORM: return (Color){ 190, 148, 246, 255 };
+        case WEATHER_VIEW_EVAPORATION: return (Color){ 224, 190, 92, 255 };
+        case WEATHER_VIEW_SNOW: return (Color){ 232, 244, 252, 255 };
+        case WEATHER_VIEW_OCEAN_TEMP: return (Color){ 238, 96, 82, 255 };
+        case WEATHER_VIEW_BIOME: return (Color){ 88, 184, 84, 255 };
+        default: return (Color){ 255, 255, 255, 255 };
+    }
+}
+
+static float WeatherChartDisplayValue(WeatherViewMode mode, float normalized)
+{
+    normalized = ClampFloat(normalized, 0.0f, 1.0f);
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+        case WEATHER_VIEW_OCEAN_TEMP:
+            return WeatherTemperatureC(normalized);
+        case WEATHER_VIEW_PRESSURE:
+            return WeatherPressureHpa(normalized);
+        case WEATHER_VIEW_WIND:
+            return normalized * 45.0f;
+        case WEATHER_VIEW_CURRENT:
+            return normalized * 3.0f;
+        case WEATHER_VIEW_RAIN:
+            return normalized * 7.0f;
+        case WEATHER_VIEW_VORTICITY:
+            return normalized * 8.0f;
+        case WEATHER_VIEW_EVAPORATION:
+            return normalized * 12.0f;
+        default:
+            return normalized * 100.0f;
+    }
+}
+
+static const char *WeatherChartUnit(WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+        case WEATHER_VIEW_OCEAN_TEMP:
+            return "C";
+        case WEATHER_VIEW_PRESSURE:
+            return "hPa";
+        case WEATHER_VIEW_WIND:
+        case WEATHER_VIEW_CURRENT:
+            return "m/s";
+        case WEATHER_VIEW_RAIN:
+            return "mm/h";
+        case WEATHER_VIEW_VORTICITY:
+            return "1e-5/s";
+        case WEATHER_VIEW_EVAPORATION:
+            return "mm/day";
+        default:
+            return "%";
+    }
+}
+
+static void FormatWeatherChartValue(WeatherViewMode mode, float normalized, char *buffer, int bufferSize)
+{
+    float value = WeatherChartDisplayValue(mode, normalized);
+    const char *unit = WeatherChartUnit(mode);
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+        case WEATHER_VIEW_OCEAN_TEMP:
+        case WEATHER_VIEW_PRESSURE:
+        case WEATHER_VIEW_HUMIDITY:
+        case WEATHER_VIEW_CLOUD:
+        case WEATHER_VIEW_STORM:
+        case WEATHER_VIEW_SNOW:
+        case WEATHER_VIEW_BIOME:
+            snprintf(buffer, (size_t)bufferSize, "%.0f %s", value, unit);
+            break;
+        case WEATHER_VIEW_WIND:
+        case WEATHER_VIEW_CURRENT:
+        case WEATHER_VIEW_RAIN:
+        case WEATHER_VIEW_VORTICITY:
+        case WEATHER_VIEW_EVAPORATION:
+            snprintf(buffer, (size_t)bufferSize, "%.1f %s", value, unit);
+            break;
+        default:
+            snprintf(buffer, (size_t)bufferSize, "%.0f %s", value, unit);
+            break;
+    }
+}
+
+static float WeatherChartMinimumSpan(WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+        case WEATHER_VIEW_OCEAN_TEMP:
+            return 8.0f / 90.0f;
+        case WEATHER_VIEW_PRESSURE:
+            return 24.0f / 525.0f;
+        case WEATHER_VIEW_WIND:
+            return 6.0f / 45.0f;
+        case WEATHER_VIEW_CURRENT:
+            return 0.55f / 3.0f;
+        case WEATHER_VIEW_RAIN:
+            return 1.0f / 7.0f;
+        case WEATHER_VIEW_VORTICITY:
+            return 1.2f / 8.0f;
+        case WEATHER_VIEW_EVAPORATION:
+            return 1.6f / 12.0f;
+        default:
+            return 0.14f;
+    }
+}
+
+static void ResetClimateChartHistory(ClimateChartHistory *history)
+{
+    memset(history, 0, sizeof(*history));
+    history->lastBin = -1;
+}
+
+static void UpdateClimateChartHistory(ClimateChartHistory *history, const WeatherCell *weather, int tileCount, float yearPhase)
+{
+    if (tileCount <= 0) return;
+
+    float sums[WEATHER_VIEW_COUNT] = { 0 };
+    float weights[WEATHER_VIEW_COUNT] = { 0 };
+    for (int i = 0; i < tileCount; i++) {
+        for (int mode = 0; mode < WEATHER_VIEW_COUNT; mode++) {
+            float weight = 1.0f;
+            if (mode == WEATHER_VIEW_CURRENT || mode == WEATHER_VIEW_OCEAN_TEMP) weight = ClampFloat(weather[i].ocean, 0.05f, 1.0f);
+            sums[mode] += WeatherChartMetricValue(&weather[i], (WeatherViewMode)mode) * weight;
+            weights[mode] += weight;
+        }
+    }
+
+    int bin = (int)(Wrap01(yearPhase) * (float)CLIMATE_CHART_BINS);
+    if (bin < 0) bin = 0;
+    if (bin >= CLIMATE_CHART_BINS) bin = CLIMATE_CHART_BINS - 1;
+
+    if (!history->initialized) {
+        for (int mode = 0; mode < WEATHER_VIEW_COUNT; mode++) {
+            float value = (weights[mode] > 0.0f) ? sums[mode] / weights[mode] : 0.0f;
+            history->latest[mode] = value;
+            for (int b = 0; b < CLIMATE_CHART_BINS; b++) history->values[mode][b] = value;
+        }
+        for (int b = 0; b < CLIMATE_CHART_BINS; b++) history->sampleCounts[b] = 1.0f;
+        history->initialized = true;
+    }
+
+    float count = fminf(history->sampleCounts[bin], CLIMATE_CHART_SAMPLE_CAP);
+    float blend = 1.0f / (count + 1.0f);
+    for (int mode = 0; mode < WEATHER_VIEW_COUNT; mode++) {
+        float value = (weights[mode] > 0.0f) ? sums[mode] / weights[mode] : 0.0f;
+        history->latest[mode] = value;
+        history->values[mode][bin] = LerpFloat(history->values[mode][bin], value, blend);
+    }
+    history->sampleCounts[bin] = fminf(count + 1.0f, CLIMATE_CHART_SAMPLE_CAP);
+    history->lastBin = bin;
 }
 
 static uint64_t HashInts3(int a, int b, int c)
@@ -1983,6 +2497,29 @@ static void DrawSunOrbitGuide(Camera3D camera, const SolarState *solar)
     }
 }
 
+static void DrawTiltAxisGuide(const Tile *tiles, int tileCount, const SolarState *solar)
+{
+    float surfaceRadius = MaxSurfaceRadius(tiles, tileCount);
+    float innerRadius = surfaceRadius + 0.050f;
+    float outerRadius = surfaceRadius + 0.62f;
+    Vector3 northInner = Vector3Scale(solar->northPole, innerRadius);
+    Vector3 northOuter = Vector3Scale(solar->northPole, outerRadius);
+    Vector3 southInner = Vector3Scale(solar->northPole, -innerRadius);
+    Vector3 southOuter = Vector3Scale(solar->northPole, -outerRadius);
+    Vector3 northTip = Vector3Scale(solar->northPole, outerRadius + 0.14f);
+    Vector3 southTip = Vector3Scale(solar->northPole, -(outerRadius + 0.14f));
+
+    DrawLine3D(southOuter, northOuter, (Color){ 226, 238, 255, 150 });
+    DrawLine3D(northInner, northOuter, (Color){ 122, 190, 255, 255 });
+    DrawLine3D(southInner, southOuter, (Color){ 255, 160, 120, 255 });
+    DrawSphere(northTip, 0.030f, (Color){ 142, 206, 255, 235 });
+    DrawSphere(southTip, 0.030f, (Color){ 255, 178, 138, 235 });
+
+    Vector3 planetUp = (Vector3){ 0.0f, 1.0f, 0.0f };
+    DrawCylinderEx(Vector3Scale(planetUp, innerRadius), Vector3Scale(planetUp, outerRadius * 0.92f), 0.010f, 0.010f, 10, (Color){ 248, 250, 255, 210 });
+    DrawCylinderEx(Vector3Scale(planetUp, -innerRadius), Vector3Scale(planetUp, -outerRadius * 0.92f), 0.010f, 0.010f, 10, (Color){ 248, 250, 255, 185 });
+}
+
 static void DrawSpaceBackground(int screenWidth, int screenHeight, float clock)
 {
     DrawRectangleGradientV(0, 0, screenWidth, screenHeight, (Color){ 5, 8, 18, 255 }, (Color){ 1, 2, 7, 255 });
@@ -2036,6 +2573,13 @@ static void DrawPlanetTiles(
         else if (weatherEnabled && weather != NULL) {
             Color weatherFill = GetWeatherViewColor(&weather[i], weatherView);
             fill = LerpColor(fill, weatherFill, WeatherViewOverlayStrength(weatherView));
+        }
+        if (!showPlateView && weather != NULL) {
+            float ice = WeatherIceAmount(&weather[i]);
+            if (ice > 0.01f) {
+                float strength = (weatherEnabled && weatherView == WEATHER_VIEW_SNOW) ? 0.72f : 0.42f;
+                fill = LerpColor(fill, WeatherIceColor(&weather[i]), ClampFloat(ice * strength, 0.0f, 0.78f));
+            }
         }
         bool isSelected = (i == selectedTile);
         if (isSelected) fill = (Color){ 246, 248, 252, 255 };
@@ -2148,7 +2692,7 @@ static void DrawSelectedTileInfo(
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
     snprintf(line, sizeof(line), "Rain %.1fmm/h  Wind %.1fm/s  Cur %.2fm/s", precipitationMmH, windSpeed, currentSpeed);
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Vort %.1f 1e-5/s", vorticityE5);
+    snprintf(line, sizeof(line), "Vort %.1f 1e-5/s  Front %.0f%%", vorticityE5, w->frontStrength * 100.0f);
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
     snprintf(line, sizeof(line), "Storm %.0f%%  Evap %.1fmm/day  Snow %.0f%%", w->storm * 100.0f, evaporationMmDay, snowPct);
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
@@ -2160,8 +2704,203 @@ static void DrawSelectedTileInfo(
     DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 });
 }
 
+static void WeatherLegendPalette(WeatherViewMode mode, Color *low, Color *mid, Color *high)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+            *low = (Color){ 60, 108, 172, 255 };
+            *mid = (Color){ 89, 158, 104, 255 };
+            *high = (Color){ 209, 156, 86, 255 };
+            break;
+        case WEATHER_VIEW_PRESSURE:
+            *low = (Color){ 60, 84, 176, 255 };
+            *mid = (Color){ 57, 151, 143, 255 };
+            *high = (Color){ 225, 157, 76, 255 };
+            break;
+        case WEATHER_VIEW_WIND:
+            *low = (Color){ 31, 50, 108, 255 };
+            *mid = (Color){ 78, 177, 211, 255 };
+            *high = (Color){ 232, 246, 252, 255 };
+            break;
+        case WEATHER_VIEW_CURRENT:
+            *low = (Color){ 22, 42, 86, 255 };
+            *mid = (Color){ 44, 154, 214, 255 };
+            *high = (Color){ 245, 236, 149, 255 };
+            break;
+        case WEATHER_VIEW_HUMIDITY:
+            *low = (Color){ 166, 125, 65, 255 };
+            *mid = (Color){ 73, 153, 98, 255 };
+            *high = (Color){ 54, 122, 190, 255 };
+            break;
+        case WEATHER_VIEW_CLOUD:
+            *low = (Color){ 36, 53, 82, 255 };
+            *mid = (Color){ 103, 127, 151, 255 };
+            *high = (Color){ 224, 231, 238, 255 };
+            break;
+        case WEATHER_VIEW_RAIN:
+            *low = (Color){ 34, 47, 63, 255 };
+            *mid = (Color){ 42, 133, 204, 255 };
+            *high = (Color){ 226, 112, 104, 255 };
+            break;
+        case WEATHER_VIEW_VORTICITY:
+            *low = (Color){ 58, 128, 218, 255 };
+            *mid = (Color){ 42, 48, 60, 255 };
+            *high = (Color){ 222, 96, 76, 255 };
+            break;
+        case WEATHER_VIEW_STORM:
+            *low = (Color){ 36, 42, 56, 255 };
+            *mid = (Color){ 102, 90, 168, 255 };
+            *high = (Color){ 244, 185, 72, 255 };
+            break;
+        case WEATHER_VIEW_EVAPORATION:
+            *low = (Color){ 38, 65, 78, 255 };
+            *mid = (Color){ 66, 157, 139, 255 };
+            *high = (Color){ 240, 210, 118, 255 };
+            break;
+        case WEATHER_VIEW_SNOW:
+            *low = (Color){ 43, 66, 92, 255 };
+            *mid = (Color){ 146, 181, 204, 255 };
+            *high = (Color){ 248, 250, 252, 255 };
+            break;
+        case WEATHER_VIEW_OCEAN_TEMP:
+            *low = (Color){ 22, 42, 86, 255 };
+            *mid = (Color){ 44, 154, 214, 255 };
+            *high = (Color){ 232, 80, 60, 255 };
+            break;
+        case WEATHER_VIEW_BIOME:
+            *low = (Color){ 18, 62, 118, 255 };
+            *mid = (Color){ 194, 174, 122, 255 };
+            *high = (Color){ 34, 88, 44, 255 };
+            break;
+        default:
+            *low = (Color){ 255, 0, 255, 255 };
+            *mid = (Color){ 255, 255, 255, 255 };
+            *high = (Color){ 255, 0, 255, 255 };
+            break;
+    }
+}
+
+static void WeatherLegendLabels(WeatherViewMode mode, char *low, int lowSize, char *mid, int midSize, char *high, int highSize)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE:
+        case WEATHER_VIEW_OCEAN_TEMP:
+            snprintf(low, (size_t)lowSize, "-45 C");
+            snprintf(mid, (size_t)midSize, "0 C");
+            snprintf(high, (size_t)highSize, "45 C");
+            break;
+        case WEATHER_VIEW_PRESSURE:
+            snprintf(low, (size_t)lowSize, "low 780 hPa");
+            snprintf(mid, (size_t)midSize, "normal 1013");
+            snprintf(high, (size_t)highSize, "high 1305");
+            break;
+        case WEATHER_VIEW_WIND:
+            snprintf(low, (size_t)lowSize, "calm");
+            snprintf(mid, (size_t)midSize, "28 m/s");
+            snprintf(high, (size_t)highSize, "55+ m/s");
+            break;
+        case WEATHER_VIEW_CURRENT:
+            snprintf(low, (size_t)lowSize, "still");
+            snprintf(mid, (size_t)midSize, "1.9 m/s");
+            snprintf(high, (size_t)highSize, "3.8+ m/s");
+            break;
+        case WEATHER_VIEW_HUMIDITY:
+            snprintf(low, (size_t)lowSize, "dry");
+            snprintf(mid, (size_t)midSize, "humid");
+            snprintf(high, (size_t)highSize, "saturated");
+            break;
+        case WEATHER_VIEW_CLOUD:
+            snprintf(low, (size_t)lowSize, "clear");
+            snprintf(mid, (size_t)midSize, "broken");
+            snprintf(high, (size_t)highSize, "overcast");
+            break;
+        case WEATHER_VIEW_RAIN:
+            snprintf(low, (size_t)lowSize, "dry");
+            snprintf(mid, (size_t)midSize, "rain");
+            snprintf(high, (size_t)highSize, "downpour/front");
+            break;
+        case WEATHER_VIEW_VORTICITY:
+            snprintf(low, (size_t)lowSize, "- spin");
+            snprintf(mid, (size_t)midSize, "calm");
+            snprintf(high, (size_t)highSize, "+ spin");
+            break;
+        case WEATHER_VIEW_STORM:
+            snprintf(low, (size_t)lowSize, "stable");
+            snprintf(mid, (size_t)midSize, "lift");
+            snprintf(high, (size_t)highSize, "severe");
+            break;
+        case WEATHER_VIEW_EVAPORATION:
+            snprintf(low, (size_t)lowSize, "low evap");
+            snprintf(mid, (size_t)midSize, "moist flux");
+            snprintf(high, (size_t)highSize, "hot/dry");
+            break;
+        case WEATHER_VIEW_SNOW:
+            snprintf(low, (size_t)lowSize, "bare");
+            snprintf(mid, (size_t)midSize, "snow");
+            snprintf(high, (size_t)highSize, "ice/glacier");
+            break;
+        case WEATHER_VIEW_BIOME:
+            snprintf(low, (size_t)lowSize, "ocean");
+            snprintf(mid, (size_t)midSize, "dry/open");
+            snprintf(high, (size_t)highSize, "wet forest");
+            break;
+        default:
+            snprintf(low, (size_t)lowSize, "low");
+            snprintf(mid, (size_t)midSize, "mid");
+            snprintf(high, (size_t)highSize, "high");
+            break;
+    }
+}
+
+static void DrawWeatherColorLegend(WeatherViewMode mode, bool weatherEnabled, bool showPlateView)
+{
+    if (!weatherEnabled || showPlateView) return;
+
+    float screenWidth = (float)GetScreenWidth();
+    float screenHeight = (float)GetScreenHeight();
+    float width = fminf(520.0f, screenWidth - 36.0f);
+    float height = 66.0f;
+    Rectangle bounds = { (screenWidth - width) * 0.5f, screenHeight - height - 18.0f, width, height };
+    Rectangle bar = { bounds.x + 18.0f, bounds.y + 30.0f, bounds.width - 36.0f, 14.0f };
+
+    Color lowColor;
+    Color midColor;
+    Color highColor;
+    WeatherLegendPalette(mode, &lowColor, &midColor, &highColor);
+    DrawRectangleRounded(bounds, 0.12f, 8, (Color){ 5, 10, 17, 214 });
+    DrawRectangleRoundedLinesEx(bounds, 0.12f, 8, 1.0f, (Color){ 69, 101, 150, 190 });
+    DrawText(WeatherViewName(mode), (int)bounds.x + 18, (int)bounds.y + 9, 15, (Color){ 232, 240, 252, 255 });
+
+    int segments = 36;
+    for (int i = 0; i < segments; i++) {
+        float t0 = (float)i / (float)segments;
+        float t1 = (float)(i + 1) / (float)segments;
+        float x0 = bar.x + bar.width * t0;
+        float x1 = bar.x + bar.width * t1;
+        Color color = (t0 < 0.5f)
+            ? LerpColor(lowColor, midColor, t0 * 2.0f)
+            : LerpColor(midColor, highColor, (t0 - 0.5f) * 2.0f);
+        DrawRectangle((int)x0, (int)bar.y, (int)ceilf(x1 - x0), (int)bar.height, color);
+    }
+    DrawRectangleLinesEx(bar, 1.0f, (Color){ 190, 212, 238, 190 });
+
+    char low[32];
+    char mid[32];
+    char high[32];
+    WeatherLegendLabels(mode, low, (int)sizeof(low), mid, (int)sizeof(mid), high, (int)sizeof(high));
+    int midWidth = MeasureText(mid, 12);
+    int highWidth = MeasureText(high, 12);
+    DrawText(low, (int)bar.x, (int)(bar.y + bar.height + 6.0f), 12, (Color){ 184, 204, 230, 245 });
+    DrawText(mid, (int)(bar.x + bar.width * 0.5f - midWidth * 0.5f), (int)(bar.y + bar.height + 6.0f), 12, (Color){ 184, 204, 230, 245 });
+    DrawText(high, (int)(bar.x + bar.width - highWidth), (int)(bar.y + bar.height + 6.0f), 12, (Color){ 184, 204, 230, 245 });
+}
+
 static int gPanelActiveWidgetId = 0;
 static int gPanelNextWidgetId = 1;
+static Vector2 gClimateChartsPosition = { 28.0f, 36.0f };
+static Vector2 gClimateChartsSize = { 740.0f, 560.0f };
+static Vector2 gClimateChartsDragOffset = { 0.0f, 0.0f };
+static bool gClimateChartsPositionInitialized = false;
 
 static Rectangle ControlPanelBounds(void)
 {
@@ -2351,6 +3090,7 @@ static bool DrawControlPanel(
     bool *tectonicsPaused,
     WeatherViewMode *weatherView,
     bool *resetWeatherRequested,
+    bool *showClimateCharts,
     const SolarState *solar
 )
 {
@@ -2416,6 +3156,7 @@ static bool DrawControlPanel(
     PanelCheckbox(&layout, "Day/Night Heating", &climate->dayNightEnabled);
     PanelCheckbox(&layout, "Seasonal Shift", &climate->seasonsEnabled);
     PanelCheckbox(&layout, "Show Sun Orbit", &climate->showSunOrbit);
+    PanelCheckbox(&layout, "Show Tilt Axis", &climate->showTiltAxis);
     PanelSliderFloat(&layout, "Day Phase", &climate->dayPhase, 0.0f, 1.0f, "%.2f");
     climate->dayPhase = Wrap01(climate->dayPhase);
     PanelSliderFloat(&layout, "Year Phase", &climate->yearPhase, 0.0f, 1.0f, "%.2f");
@@ -2434,6 +3175,9 @@ static bool DrawControlPanel(
 
     PanelDrawSectionTitle(&layout, "Views");
     PanelDrawWeatherViewSelector(&layout, weatherView);
+    if (PanelButton(&layout, *showClimateCharts ? "Hide Climate Charts" : "Pop Out Climate Charts")) {
+        *showClimateCharts = !*showClimateCharts;
+    }
 
     EndScissorMode();
 
@@ -2477,6 +3221,350 @@ static bool DrawCollapsedSidebarToggle(bool *panelOpen)
     return hovered || opened;
 }
 
+static Rectangle ClimateChartsBounds(bool collapsed)
+{
+    float screenWidth = (float)GetScreenWidth();
+    float screenHeight = (float)GetScreenHeight();
+    float minWidth = fminf(560.0f, fmaxf(360.0f, screenWidth - 36.0f));
+    float minHeight = fminf(460.0f, fmaxf(390.0f, screenHeight - 36.0f));
+    float maxWidth = fmaxf(minWidth, screenWidth - 36.0f);
+    float maxHeight = fmaxf(minHeight, screenHeight - 36.0f);
+    if (!gClimateChartsPositionInitialized) {
+        gClimateChartsPosition = (Vector2){ 28.0f, 36.0f };
+        gClimateChartsSize = (Vector2){ fminf(740.0f, maxWidth), fminf(560.0f, maxHeight) };
+        gClimateChartsPositionInitialized = true;
+    }
+    gClimateChartsSize.x = ClampFloat(gClimateChartsSize.x, minWidth, maxWidth);
+    gClimateChartsSize.y = ClampFloat(gClimateChartsSize.y, minHeight, maxHeight);
+    float width = gClimateChartsSize.x;
+    float height = collapsed ? 48.0f : gClimateChartsSize.y;
+    gClimateChartsPosition.x = ClampFloat(gClimateChartsPosition.x, 8.0f, fmaxf(8.0f, screenWidth - width - 8.0f));
+    gClimateChartsPosition.y = ClampFloat(gClimateChartsPosition.y, 8.0f, fmaxf(8.0f, screenHeight - height - 8.0f));
+    return (Rectangle){ gClimateChartsPosition.x, gClimateChartsPosition.y, width, height };
+}
+
+static void DrawChartLineRange(Rectangle chart, const float *values, int bins, int startBin, float minValue, float maxValue, Color color, float thickness)
+{
+    if (bins <= 1) return;
+    float span = fmaxf(0.001f, maxValue - minValue);
+    Vector2 prev = { 0 };
+    bool havePrev = false;
+    for (int i = 0; i < bins; i++) {
+        int bin = (startBin + i) % bins;
+        float x = chart.x + ((float)i / (float)(bins - 1)) * chart.width;
+        float normalized = ClampFloat((values[bin] - minValue) / span, 0.0f, 1.0f);
+        float y = chart.y + (1.0f - normalized) * chart.height;
+        Vector2 p = { x, y };
+        if (havePrev) DrawLineEx(prev, p, thickness, color);
+        prev = p;
+        havePrev = true;
+    }
+}
+
+static void DrawChartLine(Rectangle chart, const float *values, int bins, int startBin, Color color, float thickness)
+{
+    DrawChartLineRange(chart, values, bins, startBin, 0.0f, 1.0f, color, thickness);
+}
+
+static void DrawChartFrame(Rectangle chart, int currentBin)
+{
+    DrawRectangleRounded(chart, 0.035f, 6, (Color){ 8, 15, 27, 235 });
+    DrawRectangleRoundedLinesEx(chart, 0.035f, 6, 1.0f, (Color){ 55, 83, 128, 210 });
+    for (int i = 1; i < 4; i++) {
+        float y = chart.y + chart.height * ((float)i / 4.0f);
+        DrawLineEx((Vector2){ chart.x, y }, (Vector2){ chart.x + chart.width, y }, 1.0f, (Color){ 54, 70, 96, 95 });
+    }
+    for (int i = 1; i < 4; i++) {
+        float x = chart.x + chart.width * ((float)i / 4.0f);
+        DrawLineEx((Vector2){ x, chart.y }, (Vector2){ x, chart.y + chart.height }, 1.0f, (Color){ 54, 70, 96, 75 });
+    }
+    if (currentBin >= 0) {
+        float t = (float)currentBin / (float)(CLIMATE_CHART_BINS - 1);
+        float x = chart.x + t * chart.width;
+        DrawLineEx((Vector2){ x, chart.y }, (Vector2){ x, chart.y + chart.height }, 2.0f, (Color){ 250, 252, 255, 120 });
+    }
+}
+
+static void DrawChartRelativeLabels(Rectangle chart, const char *xLabel)
+{
+    DrawText("high", (int)chart.x - 38, (int)chart.y - 2, 12, (Color){ 158, 180, 208, 235 });
+    DrawText("mid", (int)chart.x - 32, (int)(chart.y + chart.height * 0.5f - 6), 12, (Color){ 128, 150, 178, 220 });
+    DrawText("low", (int)chart.x - 32, (int)(chart.y + chart.height - 12), 12, (Color){ 158, 180, 208, 235 });
+    DrawText("relative trend", (int)chart.x + 8, (int)chart.y + 6, 13, (Color){ 178, 204, 234, 245 });
+    int xWidth = MeasureText(xLabel, 13);
+    DrawText(xLabel, (int)(chart.x + chart.width - xWidth), (int)(chart.y + chart.height + 8), 13, (Color){ 178, 204, 234, 245 });
+}
+
+static void ClimateChartRange(const ClimateChartHistory *history, WeatherViewMode mode, float *minOut, float *maxOut)
+{
+    int selected = (int)mode;
+    float minValue = history->initialized ? history->values[selected][0] : history->latest[selected];
+    float maxValue = minValue;
+    for (int i = 0; i < CLIMATE_CHART_BINS; i++) {
+        float value = history->values[selected][i];
+        minValue = fminf(minValue, value);
+        maxValue = fmaxf(maxValue, value);
+    }
+
+    float minimumSpan = WeatherChartMinimumSpan(mode);
+    float span = maxValue - minValue;
+    float center = (minValue + maxValue) * 0.5f;
+    if (span < minimumSpan) {
+        minValue = center - minimumSpan * 0.5f;
+        maxValue = center + minimumSpan * 0.5f;
+    } else {
+        float padding = span * 0.16f;
+        minValue -= padding;
+        maxValue += padding;
+    }
+
+    if (minValue < 0.0f) {
+        maxValue = fminf(1.0f, maxValue - minValue);
+        minValue = 0.0f;
+    }
+    if (maxValue > 1.0f) {
+        minValue = fmaxf(0.0f, minValue - (maxValue - 1.0f));
+        maxValue = 1.0f;
+    }
+    if (maxValue - minValue < 0.001f) maxValue = fminf(1.0f, minValue + 0.001f);
+
+    *minOut = minValue;
+    *maxOut = maxValue;
+}
+
+static void DrawChartMetricLabelsRange(Rectangle chart, WeatherViewMode mode, float minValue, float maxValue, const char *xLabel)
+{
+    char top[32];
+    char mid[32];
+    char low[32];
+    float midValue = (minValue + maxValue) * 0.5f;
+    FormatWeatherChartValue(mode, maxValue, top, (int)sizeof(top));
+    FormatWeatherChartValue(mode, midValue, mid, (int)sizeof(mid));
+    FormatWeatherChartValue(mode, minValue, low, (int)sizeof(low));
+    int topWidth = MeasureText(top, 12);
+    int midWidth = MeasureText(mid, 12);
+    int lowWidth = MeasureText(low, 12);
+    DrawText(top, (int)(chart.x - topWidth - 8), (int)chart.y - 2, 12, (Color){ 158, 180, 208, 235 });
+    DrawText(mid, (int)(chart.x - midWidth - 8), (int)(chart.y + chart.height * 0.5f - 6), 12, (Color){ 128, 150, 178, 220 });
+    DrawText(low, (int)(chart.x - lowWidth - 8), (int)(chart.y + chart.height - 12), 12, (Color){ 158, 180, 208, 235 });
+    char label[80];
+    snprintf(label, sizeof(label), "%s (%s, adaptive)", WeatherViewShortName(mode), WeatherChartUnit(mode));
+    DrawText(label, (int)chart.x + 8, (int)chart.y + 6, 13, (Color){ 178, 204, 234, 245 });
+    int xWidth = MeasureText(xLabel, 13);
+    DrawText(xLabel, (int)(chart.x + chart.width - xWidth), (int)(chart.y + chart.height + 8), 13, (Color){ 178, 204, 234, 245 });
+}
+
+static const char *WeatherChartDescription(WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE: return "global air temperature index";
+        case WEATHER_VIEW_PRESSURE: return "surface pressure index";
+        case WEATHER_VIEW_WIND: return "wind speed index";
+        case WEATHER_VIEW_CURRENT: return "ocean current speed index";
+        case WEATHER_VIEW_HUMIDITY: return "relative humidity index";
+        case WEATHER_VIEW_CLOUD: return "cloud and condensate coverage";
+        case WEATHER_VIEW_RAIN: return "rainfall and frontal precipitation";
+        case WEATHER_VIEW_VORTICITY: return "cyclonic/rotational activity";
+        case WEATHER_VIEW_STORM: return "storm lift and instability";
+        case WEATHER_VIEW_EVAPORATION: return "evaporation and drying";
+        case WEATHER_VIEW_SNOW: return "snow and ice coverage";
+        case WEATHER_VIEW_OCEAN_TEMP: return "ocean mixed-layer temperature";
+        case WEATHER_VIEW_BIOME: return "land greenness/moisture index";
+        default: return "weather index";
+    }
+}
+
+static bool ClimateMetricRow(Rectangle rect, WeatherViewMode mode, WeatherViewMode *selectedMode, const ClimateChartHistory *history)
+{
+    Vector2 mouse = GetMousePosition();
+    bool hovered = CheckCollisionPointRec(mouse, rect);
+    int id = -300 - (int)mode;
+    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
+    bool selected = (*selectedMode == mode);
+    bool triggered = false;
+    if (gPanelActiveWidgetId == id && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        *selectedMode = mode;
+        selected = true;
+        triggered = true;
+    }
+    if (gPanelActiveWidgetId == id && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    Color fill = selected ? (Color){ 25, 58, 104, 242 }
+        : hovered ? (Color){ 18, 38, 68, 238 }
+        : (Color){ 10, 20, 34, 228 };
+    DrawRectangleRounded(rect, 0.08f, 6, fill);
+    DrawRectangleRoundedLinesEx(rect, 0.08f, 6, 1.0f, selected ? (Color){ 112, 172, 238, 220 } : (Color){ 42, 66, 104, 180 });
+    Color color = WeatherChartLineColor(mode);
+    DrawRectangle((int)rect.x + 9, (int)rect.y + 9, 10, 10, color);
+    DrawText(WeatherViewShortName(mode), (int)rect.x + 26, (int)rect.y + 5, 14, (Color){ 226, 236, 250, 255 });
+    char latest[24];
+    float latestValue = history->initialized ? history->latest[(int)mode] : 0.0f;
+    FormatWeatherChartValue(mode, latestValue, latest, (int)sizeof(latest));
+    int latestWidth = MeasureText(latest, 13);
+    DrawText(latest, (int)(rect.x + rect.width - latestWidth - 10), (int)rect.y + 7, 13, (Color){ 166, 194, 226, 255 });
+    return triggered;
+}
+
+static bool DrawClimateChartsPopup(
+    bool *open,
+    bool *collapsed,
+    const ClimateChartHistory *history,
+    WeatherViewMode *selectedMode,
+    float yearPhase
+)
+{
+    if (!*open) return false;
+
+    Rectangle bounds = ClimateChartsBounds(*collapsed);
+    Vector2 mouse = GetMousePosition();
+    bool hovered = CheckCollisionPointRec(mouse, bounds);
+    int dragId = -221;
+    int resizeId = -222;
+    int collapseId = -223;
+    Rectangle dragRect = { bounds.x, bounds.y, bounds.width - 82.0f, 48.0f };
+    Rectangle resizeRect = { bounds.x + bounds.width - 24.0f, bounds.y + bounds.height - 24.0f, 18.0f, 18.0f };
+    bool dragHover = CheckCollisionPointRec(mouse, dragRect);
+    bool resizeHover = !*collapsed && CheckCollisionPointRec(mouse, resizeRect);
+    if (resizeHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        gPanelActiveWidgetId = resizeId;
+        gClimateChartsDragOffset = (Vector2){ bounds.x + bounds.width - mouse.x, bounds.y + bounds.height - mouse.y };
+    } else if (dragHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+        gPanelActiveWidgetId = dragId;
+        gClimateChartsDragOffset = (Vector2){ mouse.x - bounds.x, mouse.y - bounds.y };
+    }
+    if (gPanelActiveWidgetId == dragId) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            gClimateChartsPosition = (Vector2){ mouse.x - gClimateChartsDragOffset.x, mouse.y - gClimateChartsDragOffset.y };
+            bounds = ClimateChartsBounds(*collapsed);
+            dragRect = (Rectangle){ bounds.x, bounds.y, bounds.width - 82.0f, 48.0f };
+            resizeRect = (Rectangle){ bounds.x + bounds.width - 24.0f, bounds.y + bounds.height - 24.0f, 18.0f, 18.0f };
+        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            gPanelActiveWidgetId = 0;
+        }
+    }
+    if (gPanelActiveWidgetId == resizeId) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            gClimateChartsSize = (Vector2){
+                mouse.x - bounds.x + gClimateChartsDragOffset.x,
+                mouse.y - bounds.y + gClimateChartsDragOffset.y
+            };
+            bounds = ClimateChartsBounds(*collapsed);
+            dragRect = (Rectangle){ bounds.x, bounds.y, bounds.width - 82.0f, 48.0f };
+            resizeRect = (Rectangle){ bounds.x + bounds.width - 24.0f, bounds.y + bounds.height - 24.0f, 18.0f, 18.0f };
+        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+            gPanelActiveWidgetId = 0;
+        }
+    }
+    int closeId = -220;
+    Rectangle closeRect = { bounds.x + bounds.width - 38.0f, bounds.y + 10.0f, 26.0f, 26.0f };
+    Rectangle collapseRect = { closeRect.x - 34.0f, bounds.y + 10.0f, 26.0f, 26.0f };
+    bool closeHover = CheckCollisionPointRec(mouse, closeRect);
+    bool collapseHover = CheckCollisionPointRec(mouse, collapseRect);
+    if (collapseHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = collapseId;
+    if (gPanelActiveWidgetId == collapseId && collapseHover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) *collapsed = !*collapsed;
+    if (gPanelActiveWidgetId == collapseId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+    if (closeHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = closeId;
+    if (gPanelActiveWidgetId == closeId && closeHover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) *open = false;
+    if (gPanelActiveWidgetId == closeId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
+
+    DrawRectangleRounded(bounds, 0.025f, 8, (Color){ 7, 10, 17, 246 });
+    DrawRectangleRoundedLinesEx(bounds, 0.025f, 8, 1.0f, (Color){ 66, 99, 152, 230 });
+    DrawRectangle((int)bounds.x, (int)bounds.y, (int)bounds.width, 48, (Color){ 15, 29, 52, 250 });
+    DrawText("Planet Weather Cycles", (int)bounds.x + 18, (int)bounds.y + 13, 24, (Color){ 242, 247, 255, 255 });
+    char phaseText[64];
+    int dayOfYear = 1 + (int)(Wrap01(yearPhase) * 365.0f);
+    if (dayOfYear > 365) dayOfYear = 365;
+    snprintf(phaseText, sizeof(phaseText), "Day %d", dayOfYear);
+    int phaseWidth = MeasureText(phaseText, 16);
+    DrawText(phaseText, (int)(collapseRect.x - phaseWidth - 18), (int)bounds.y + 18, 16, (Color){ 172, 198, 232, 255 });
+    DrawRectangleRounded(collapseRect, 0.18f, 6, collapseHover ? (Color){ 38, 78, 132, 255 } : (Color){ 20, 44, 80, 255 });
+    DrawText(*collapsed ? "+" : "-", (int)collapseRect.x + 8, (int)collapseRect.y + 3, 19, (Color){ 238, 244, 252, 255 });
+    DrawRectangleRounded(closeRect, 0.18f, 6, closeHover ? (Color){ 38, 78, 132, 255 } : (Color){ 20, 44, 80, 255 });
+    DrawText("X", (int)closeRect.x + 8, (int)closeRect.y + 4, 17, (Color){ 238, 244, 252, 255 });
+    if (*collapsed) return hovered;
+
+    DrawLineEx((Vector2){ resizeRect.x + 4.0f, resizeRect.y + 16.0f }, (Vector2){ resizeRect.x + 16.0f, resizeRect.y + 4.0f }, 2.0f, resizeHover ? (Color){ 210, 232, 255, 255 } : (Color){ 112, 150, 196, 220 });
+    DrawLineEx((Vector2){ resizeRect.x + 9.0f, resizeRect.y + 16.0f }, (Vector2){ resizeRect.x + 16.0f, resizeRect.y + 9.0f }, 2.0f, resizeHover ? (Color){ 210, 232, 255, 255 } : (Color){ 112, 150, 196, 220 });
+
+    float margin = 18.0f;
+    int selected = (int)(*selectedMode);
+    int currentBin = (int)(Wrap01(yearPhase) * (float)CLIMATE_CHART_BINS);
+    if (currentBin >= CLIMATE_CHART_BINS) currentBin = CLIMATE_CHART_BINS - 1;
+    int currentMarker = CLIMATE_CHART_BINS - 1;
+
+    Rectangle summary = { bounds.x + margin + 42.0f, bounds.y + 86.0f, bounds.width - margin * 2.0f - 42.0f, 106.0f };
+    DrawText("Summary", (int)summary.x, (int)summary.y - 24, 17, (Color){ 220, 230, 244, 255 });
+    DrawChartFrame(summary, currentMarker);
+    char dayLabel[64];
+    snprintf(dayLabel, sizeof(dayLabel), "year cycle -> day %d", dayOfYear);
+    DrawChartRelativeLabels(summary, dayLabel);
+
+    int startBin = (currentBin + 1) % CLIMATE_CHART_BINS;
+    const WeatherViewMode summaryModes[] = {
+        WEATHER_VIEW_TEMPERATURE,
+        WEATHER_VIEW_HUMIDITY,
+        WEATHER_VIEW_CLOUD,
+        WEATHER_VIEW_RAIN,
+        WEATHER_VIEW_WIND,
+        WEATHER_VIEW_SNOW
+    };
+    if (history->initialized) {
+        for (int i = 0; i < (int)(sizeof(summaryModes) / sizeof(summaryModes[0])); i++) {
+            int mode = (int)summaryModes[i];
+            Color color = WeatherChartLineColor(summaryModes[i]);
+            color.a = 205;
+            DrawChartLine(summary, history->values[mode], CLIMATE_CHART_BINS, startBin, color, 1.8f);
+        }
+    }
+
+    float legendX = summary.x;
+    float legendY = summary.y + summary.height + 18.0f;
+    for (int i = 0; i < (int)(sizeof(summaryModes) / sizeof(summaryModes[0])); i++) {
+        WeatherViewMode mode = summaryModes[i];
+        Color color = WeatherChartLineColor(mode);
+        Rectangle swatch = { legendX, legendY, 9.0f, 9.0f };
+        DrawRectangleRec(swatch, color);
+        DrawText(WeatherViewShortName(mode), (int)swatch.x + 13, (int)swatch.y - 3, 12, (Color){ 178, 198, 224, 235 });
+        legendX += 96.0f;
+    }
+
+    float contentTop = legendY + 34.0f;
+    float listWidth = 230.0f;
+    Rectangle listBounds = { bounds.x + margin, contentTop, listWidth, bounds.y + bounds.height - contentTop - margin };
+    Rectangle detail = { listBounds.x + listWidth + 72.0f, contentTop + 64.0f, bounds.x + bounds.width - (listBounds.x + listWidth + 72.0f) - margin, listBounds.height - 104.0f };
+
+    DrawText("Metric", (int)listBounds.x, (int)listBounds.y - 24, 17, (Color){ 220, 230, 244, 255 });
+    DrawText("latest", (int)(listBounds.x + listBounds.width - 46), (int)listBounds.y - 21, 12, (Color){ 148, 174, 204, 235 });
+    float rowStep = fminf(25.0f, listBounds.height / (float)WEATHER_VIEW_COUNT);
+    float rowHeight = fmaxf(16.0f, rowStep - 3.0f);
+    for (int mode = 0; mode < WEATHER_VIEW_COUNT; mode++) {
+        Rectangle row = { listBounds.x, listBounds.y + (float)mode * rowStep, listBounds.width, rowHeight };
+        ClimateMetricRow(row, (WeatherViewMode)mode, selectedMode, history);
+    }
+
+    selected = (int)(*selectedMode);
+    Color selectedColor = WeatherChartLineColor(*selectedMode);
+    DrawRectangle((int)detail.x, (int)contentTop, 12, 12, selectedColor);
+    DrawText(WeatherViewName(*selectedMode), (int)detail.x + 18, (int)contentTop - 4, 20, (Color){ 238, 244, 252, 255 });
+    DrawText(WeatherChartDescription(*selectedMode), (int)detail.x, (int)contentTop + 20, 14, (Color){ 164, 190, 220, 245 });
+    char latestText[64];
+    float latestValue = history->initialized ? history->latest[selected] : 0.0f;
+    char valueText[32];
+    FormatWeatherChartValue(*selectedMode, latestValue, valueText, (int)sizeof(valueText));
+    snprintf(latestText, sizeof(latestText), "current %s", valueText);
+    int latestWidth = MeasureText(latestText, 15);
+    DrawText(latestText, (int)(detail.x + detail.width - latestWidth), (int)contentTop + 2, 15, (Color){ 190, 214, 242, 255 });
+
+    float rangeMin = 0.0f;
+    float rangeMax = 1.0f;
+    ClimateChartRange(history, *selectedMode, &rangeMin, &rangeMax);
+    DrawChartFrame(detail, currentMarker);
+    DrawChartMetricLabelsRange(detail, *selectedMode, rangeMin, rangeMax, dayLabel);
+    if (history->initialized) DrawChartLineRange(detail, history->values[selected], CLIMATE_CHART_BINS, startBin, rangeMin, rangeMax, selectedColor, 3.0f);
+
+    return hovered;
+}
+
 static void DrawWeatherClouds(
     const Tile *tiles,
     const WeatherCell *weather,
@@ -2484,20 +3572,25 @@ static void DrawWeatherClouds(
     WeatherViewMode mode
 )
 {
-    if (mode != WEATHER_VIEW_CLOUD && mode != WEATHER_VIEW_RAIN) return;
+    bool focusMode = (mode == WEATHER_VIEW_CLOUD || mode == WEATHER_VIEW_RAIN || mode == WEATHER_VIEW_STORM);
     rlDisableBackfaceCulling();
     for (int i = 0; i < tileCount; i++) {
         const Tile *tile = &tiles[i];
-        float cloud = weather[i].cloud;
-        float storm = weather[i].precipitation;
-        float alphaBlend = cloud * 0.78f + storm * 0.50f - 0.18f;
+        float cloud = fmaxf(weather[i].cloud, weather[i].cloudWater * 1.34f);
+        float storm = fmaxf(weather[i].precipitation, weather[i].storm);
+        float breakup = SphericalNoise3(weather[i].normal, 18.0f, (Vector3){ (float)GetTime() * 0.020f, 37.0f, -19.0f }, 2, 2.1f, 0.50f);
+        float cellular = HashFromDirection(weather[i].normal, 701.0f);
+        float cloudShape = ClampFloat(cloud + (breakup - 0.5f) * 0.30f + (cellular - 0.5f) * 0.12f, 0.0f, 1.0f);
+        float alphaBlend = cloudShape * (focusMode ? 0.86f : 0.44f) + storm * (focusMode ? 0.42f : 0.20f) - (focusMode ? 0.16f : 0.24f);
         if (alphaBlend <= 0.0f) continue;
 
-        unsigned char alpha = (unsigned char)(ClampFloat(alphaBlend, 0.0f, 1.0f) * 170.0f);
-        Color cloudColor = LerpColor((Color){ 246, 248, 252, 255 }, (Color){ 192, 201, 212, 255 }, ClampFloat(storm * 0.9f, 0.0f, 1.0f));
+        unsigned char alpha = (unsigned char)(ClampFloat(alphaBlend, 0.0f, 1.0f) * (focusMode ? 178.0f : 112.0f));
+        Color fairCloud = LerpColor((Color){ 250, 252, 255, 255 }, (Color){ 224, 231, 238, 255 }, ClampFloat(cloudShape, 0.0f, 1.0f));
+        Color stormCloud = LerpColor((Color){ 168, 178, 190, 255 }, (Color){ 86, 92, 108, 255 }, ClampFloat(storm * 1.2f, 0.0f, 1.0f));
+        Color cloudColor = LerpColor(fairCloud, stormCloud, ClampFloat(storm * 0.85f + weather[i].frontStrength * 0.20f, 0.0f, 1.0f));
         cloudColor.a = alpha;
 
-        float lift = CLOUD_LAYER_HEIGHT + cloud * 0.008f;
+        float lift = CLOUD_LAYER_HEIGHT + cloudShape * 0.010f + storm * 0.010f + weather[i].frontStrength * 0.004f;
         Vector3 cDir = Vector3Normalize(tile->center);
         Vector3 c = Vector3Scale(cDir, Vector3Length(tile->center) + lift);
 
@@ -2695,6 +3788,7 @@ int main(void)
         .dayNightEnabled = true,
         .seasonsEnabled = true,
         .showSunOrbit = false,
+        .showTiltAxis = true,
         .dayPhase = 0.18f,
         .yearPhase = 0.08f,
         .daySpeed = 1.0f,
@@ -2744,6 +3838,9 @@ int main(void)
     WeatherCell *weatherB = (WeatherCell *)calloc((size_t)tileCount, sizeof(WeatherCell));
     InitializeWeather(weatherA, tiles, tileCount, &climate, &solar);
     memcpy(weatherB, weatherA, sizeof(WeatherCell) * (size_t)tileCount);
+    ClimateChartHistory climateCharts = { 0 };
+    ResetClimateChartHistory(&climateCharts);
+    UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
     atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
     SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
 
@@ -2761,7 +3858,10 @@ int main(void)
     bool showPlateView = false;
     bool tectonicsPaused = false;
     bool weatherEnabled = true;
+    bool showClimateCharts = false;
+    bool showClimateChartsCollapsed = false;
     WeatherViewMode weatherView = WEATHER_VIEW_TEMPERATURE;
+    WeatherViewMode climateChartView = WEATHER_VIEW_TEMPERATURE;
     int selectedTile = -1;
     Vector2 clickStart = { 0 };
     float tectonicRebuildTimer = 0.0f;
@@ -2775,13 +3875,17 @@ int main(void)
         Rectangle sidebarToggleRect = SidebarToggleBounds(climate.panelOpen);
         bool controlPanelHovered = climate.panelOpen && CheckCollisionPointRec(GetMousePosition(), controlPanelRect);
         bool sidebarToggleHovered = CheckCollisionPointRec(GetMousePosition(), sidebarToggleRect);
-        bool uiHovered = controlPanelHovered || sidebarToggleHovered;
+        bool climateChartsHovered = showClimateCharts && CheckCollisionPointRec(GetMousePosition(), ClimateChartsBounds(showClimateChartsCollapsed));
+        bool climateChartsCapturing = showClimateCharts && gPanelActiveWidgetId <= -220;
+        bool uiHovered = controlPanelHovered || sidebarToggleHovered || climateChartsHovered || climateChartsCapturing;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiHovered) clickStart = GetMousePosition();
         if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
         if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
         if (IsKeyPressed(KEY_SPACE)) tectonicsPaused = !tectonicsPaused;
+        if (IsKeyPressed(KEY_P)) climate.autoAdvanceTime = !climate.autoAdvanceTime;
         if (IsKeyPressed(KEY_W)) weatherEnabled = !weatherEnabled;
         if (IsKeyPressed(KEY_F1)) climate.panelOpen = !climate.panelOpen;
+        if (IsKeyPressed(KEY_T)) climate.showTiltAxis = !climate.showTiltAxis;
         if (IsKeyPressed(KEY_TAB)) weatherView = (WeatherViewMode)((weatherView + 1) % WEATHER_VIEW_COUNT);
         if (IsKeyPressed(KEY_ONE)) weatherView = WEATHER_VIEW_TEMPERATURE;
         if (IsKeyPressed(KEY_TWO)) weatherView = WEATHER_VIEW_PRESSURE;
@@ -2813,6 +3917,8 @@ int main(void)
         if (resetWeatherRequested) {
             InitializeWeather(weatherA, tiles, tileCount, &climate, &solar);
             memcpy(weatherB, weatherA, sizeof(WeatherCell) * (size_t)tileCount);
+            ResetClimateChartHistory(&climateCharts);
+            UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
             weatherTimer = 0.0f;
             resetWeatherRequested = false;
         }
@@ -2836,6 +3942,7 @@ int main(void)
                 WeatherCell *swap = weatherA;
                 weatherA = weatherB;
                 weatherB = swap;
+                UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
                 weatherTimer -= weatherStep;
             }
         }
@@ -2862,6 +3969,7 @@ int main(void)
         ClearBackground((Color){ 0, 0, 0, 0 });
         BeginMode3D(camera);
         DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile);
+        if (climate.showTiltAxis) DrawTiltAxisGuide(tiles, tileCount, &solar);
         if (!showPlateView && weatherEnabled) DrawWeatherClouds(tiles, weatherA, tileCount, weatherView);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_WIND) DrawWindVectors(tiles, weatherA, tileCount);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_CURRENT) DrawCurrentVectors(tiles, weatherA, tileCount);
@@ -2901,11 +4009,13 @@ int main(void)
         }
 
         DrawSelectedTileInfo(tiles, plates, weatherA, tileCount, selectedTile, tectonicsPaused, weatherEnabled, weatherView);
+        DrawWeatherColorLegend(weatherView, weatherEnabled, showPlateView);
         if (climate.panelOpen) {
-            DrawControlPanel(&climate, &showPlateView, &atmosphereEnabled, &weatherEnabled, &tectonicsPaused, &weatherView, &resetWeatherRequested, &solar);
+            DrawControlPanel(&climate, &showPlateView, &atmosphereEnabled, &weatherEnabled, &tectonicsPaused, &weatherView, &resetWeatherRequested, &showClimateCharts, &solar);
         } else {
             DrawCollapsedSidebarToggle(&climate.panelOpen);
         }
+        DrawClimateChartsPopup(&showClimateCharts, &showClimateChartsCollapsed, &climateCharts, &climateChartView, climate.yearPhase);
 
         EndDrawing();
     }
