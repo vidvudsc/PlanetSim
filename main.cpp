@@ -3039,18 +3039,16 @@ struct UiState {
     bool uiVisible = true;
 
     bool showControls = true;
-    bool showInspector = true;
     bool showCharts = false;
     bool showLegend = true;
     bool showOrbitMap = true;
-    bool showImGuiDemo = false;
-    bool showImPlotDemo = false;
 
     // Orbit map
     bool orbitMapMaximized = false;
     float orbitYaw = 0.7f;
     float orbitPitch = 0.55f;
     float orbitDistance = 3.4f;
+    bool orbitAutoFit = true;
     RenderTexture2D orbitTex{};
     int orbitTexW = 0;
     int orbitTexH = 0;
@@ -3166,13 +3164,9 @@ static void UiDrawTopBar(ClimateSettings &climate, int simHz)
         if (ImGui::SmallButton("Panels  v")) ImGui::OpenPopup("PanelsMenu");
         if (ImGui::BeginPopup("PanelsMenu")) {
             ImGui::MenuItem("Controls",    "F2", &g_ui.showControls);
-            ImGui::MenuItem("Inspector",   "F3", &g_ui.showInspector);
             ImGui::MenuItem("Charts",      "F4", &g_ui.showCharts);
             ImGui::MenuItem("Legend",      "F5", &g_ui.showLegend);
             ImGui::MenuItem("Orbit map",   "F6", &g_ui.showOrbitMap);
-            ImGui::Separator();
-            ImGui::MenuItem("ImGui demo",  nullptr, &g_ui.showImGuiDemo);
-            ImGui::MenuItem("ImPlot demo", nullptr, &g_ui.showImPlotDemo);
             ImGui::Separator();
             ImGui::SetNextItemWidth(140);
             ImGui::SliderFloat("UI alpha", &g_ui.uiAlpha, 0.20f, 1.0f, "%.2f");
@@ -3256,16 +3250,13 @@ static void UiDrawInspectorWindow(const Tile *tiles, const Plate *plates, const 
                                   int tileCount, int selectedTile, WeatherViewMode weatherView)
 {
     (void)plates;
-    if (!g_ui.showInspector) return;
+    if (selectedTile < 0 || selectedTile >= tileCount) return;
+
     int sw = GetScreenWidth();
     ImGui::SetNextWindowPos(ImVec2((float)(sw - 328), 60.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(320, 480), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Tile inspector", &g_ui.showInspector)) { ImGui::End(); return; }
-    if (selectedTile < 0 || selectedTile >= tileCount) {
-        ImGui::TextDisabled("Click a tile on the globe to inspect.");
-        ImGui::End();
-        return;
-    }
+    ImGui::SetNextWindowSize(ImVec2(320, 360), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse;
+    if (!ImGui::Begin("Tile inspector", nullptr, flags)) { ImGui::End(); return; }
     const Tile &t = tiles[selectedTile];
     const WeatherCell &w = weather[selectedTile];
     Vector3 n = Vector3Normalize(t.baseCenterDir);
@@ -3308,11 +3299,13 @@ static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPha
 {
     if (!g_ui.showCharts) return;
     int sh = GetScreenHeight();
-    ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 320)), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(560, 300), ImGuiCond_FirstUseEver);
-    if (!ImGui::Begin("Climate charts", &g_ui.showCharts)) { ImGui::End(); return; }
+    ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 280)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(520, 260), ImGuiCond_FirstUseEver);
+    ImGuiWindowFlags wflags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
+    if (!ImGui::Begin("Climate charts", &g_ui.showCharts, wflags)) { ImGui::End(); return; }
 
-    if (ImGui::BeginCombo("Metric", WeatherViewName(g_ui.chartsMode))) {
+    ImGui::SetNextItemWidth(170);
+    if (ImGui::BeginCombo("##metric", WeatherViewName(g_ui.chartsMode))) {
         for (int i = 0; i < WEATHER_VIEW_COUNT; i++) {
             bool s = ((int)g_ui.chartsMode == i);
             if (ImGui::Selectable(WeatherViewName((WeatherViewMode)i), s))
@@ -3321,7 +3314,7 @@ static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPha
         ImGui::EndCombo();
     }
     ImGui::SameLine();
-    ImGui::TextDisabled(" %s", WeatherChartDescription(g_ui.chartsMode));
+    ImGui::TextDisabled("yearly cycle");
 
     float xs[CLIMATE_CHART_BINS];
     float ys[CLIMATE_CHART_BINS];
@@ -3335,14 +3328,22 @@ static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPha
     }
 
     if (ImPlot::BeginPlot("##chart", ImVec2(-1, -1),
-                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText)) {
-        ImPlot::SetupAxes("Year fraction", WeatherChartUnit(g_ui.chartsMode),
-                          ImPlotAxisFlags_None,
-                          ImPlotAxisFlags_AutoFit);
+                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
+        ImPlot::SetupAxes("year phase", WeatherChartUnit(g_ui.chartsMode),
+                          ImPlotAxisFlags_NoMenus,
+                          ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_NoMenus);
         ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Always);
-        if (n > 1) ImPlot::PlotLine(WeatherViewShortName(g_ui.chartsMode), xs, ys, n);
+        if (n > 1) {
+            ImPlotSpec spec;
+            spec.LineColor = ImVec4(0.42f, 0.78f, 1.0f, 1.0f);
+            spec.LineWeight = 2.0f;
+            ImPlot::PlotLine(WeatherViewShortName(g_ui.chartsMode), xs, ys, n, spec);
+        }
         double cur = yearPhase;
-        ImPlot::PlotInfLines("##now", &cur, 1);
+        ImPlotSpec nowSpec;
+        nowSpec.LineColor = ImVec4(1.0f, 0.78f, 0.32f, 0.70f);
+        nowSpec.LineWeight = 1.5f;
+        ImPlot::PlotInfLines("##now", &cur, 1, nowSpec);
         ImPlot::EndPlot();
     }
     ImGui::End();
@@ -3353,9 +3354,8 @@ static void UiDrawLegendWindow(WeatherViewMode weatherView, bool weatherEnabled,
     if (!g_ui.showLegend) return;
     if (showPlateView || !weatherEnabled) return;
 
-    int sw = GetScreenWidth();
     int sh = GetScreenHeight();
-    ImGui::SetNextWindowPos(ImVec2((float)(sw - 248), (float)(sh - 116)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 116)), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(240, 100), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowBgAlpha(0.78f);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
@@ -3400,6 +3400,14 @@ static void UiRenderOrbitMapTexture(const SolarState &solar, const ClimateSettin
     BeginTextureMode(g_ui.orbitTex);
     ClearBackground((Color){ 8, 11, 22, 255 });
 
+    if (g_ui.orbitAutoFit) {
+        float a = fmaxf(0.05f, climate.orbitDistanceAu);
+        float ecc = ClampFloat(climate.orbitEccentricity, 0.0f, 0.85f);
+        float c = a * ecc;
+        float extent = fmaxf(a + c, solar.habitableZoneOuterAu);
+        g_ui.orbitDistance = extent * 2.4f + 0.6f;
+    }
+
     Camera3D cam{};
     Vector3 dir = {
         cosf(g_ui.orbitPitch) * cosf(g_ui.orbitYaw),
@@ -3413,42 +3421,69 @@ static void UiRenderOrbitMapTexture(const SolarState &solar, const ClimateSettin
     cam.projection = CAMERA_PERSPECTIVE;
 
     BeginMode3D(cam);
-    // Star at origin
-    Color starCol = solar.starColor;
-    DrawSphere((Vector3){ 0, 0, 0 }, 0.18f, starCol);
-    DrawSphereWires((Vector3){ 0, 0, 0 }, 0.22f, 8, 12, ColorAlpha(starCol, 0.35f));
 
-    // Planet orbit ellipse in the equatorial plane of the SYSTEM (not the planet)
+    // --- Real orbital elements (sun is at the FOCUS of the ellipse, not the centre)
+    float a   = fmaxf(0.05f, climate.orbitDistanceAu);          // semi-major axis [AU]
     float ecc = ClampFloat(climate.orbitEccentricity, 0.0f, 0.85f);
-    float a = 1.0f;
-    float b = a * sqrtf(fmaxf(0.0f, 1.0f - ecc * ecc));
+    float b   = a * sqrtf(fmaxf(0.0f, 1.0f - ecc * ecc));        // semi-minor axis
+    float c   = a * ecc;                                         // focal offset
+
+    // --- Habitable zone as a fuzzy green annulus (many ring loops + filled discs at low alpha)
+    float hzIn  = solar.habitableZoneInnerAu;
+    float hzOut = solar.habitableZoneOuterAu;
+    if (hzOut > hzIn && hzOut > 0.01f) {
+        const int hzRings = 18;
+        for (int i = 0; i < hzRings; i++) {
+            float t = (float)i / (float)(hzRings - 1);
+            float r = LerpFloat(hzIn, hzOut, t);
+            float edge = fabsf(t - 0.5f) * 2.0f;     // 0 at centre, 1 at either edge
+            float falloff = 1.0f - edge * edge;      // smooth, peaks in the middle
+            unsigned char alpha = (unsigned char)(34.0f * falloff + 6.0f);
+            DrawCircle3D((Vector3){ 0, 0, 0 }, r,
+                         (Vector3){ 1, 0, 0 }, 90.0f,
+                         (Color){ 90, 220, 130, alpha });
+        }
+    }
+
+    // --- Star at origin
+    Color starCol = solar.starColor;
+    DrawSphere((Vector3){ 0, 0, 0 }, 0.10f + 0.04f * sqrtf(climate.stellarLuminosity), starCol);
+    DrawSphereWires((Vector3){ 0, 0, 0 }, 0.13f + 0.04f * sqrtf(climate.stellarLuminosity), 8, 12, ColorAlpha(starCol, 0.35f));
+
+    // --- Planet orbit ellipse (in the orbit plane; star/focus at origin -> centre offset by -c along +X)
     Vector3 prev{};
     bool havePrev = false;
-    const int seg = 128;
+    const int seg = 160;
     for (int i = 0; i <= seg; i++) {
         float th = (float)i / (float)seg * 2.0f * PI;
-        Vector3 p = { a * cosf(th) - ecc * a, 0.0f, b * sinf(th) };
-        if (havePrev) DrawLine3D(prev, p, (Color){ 120, 178, 232, 200 });
+        Vector3 p = { a * cosf(th) - c, 0.0f, b * sinf(th) };
+        if (havePrev) DrawLine3D(prev, p, (Color){ 130, 188, 240, 220 });
         prev = p;
         havePrev = true;
     }
+    // Periapsis & apoapsis markers
+    DrawSphere((Vector3){  a - c, 0.0f, 0.0f }, 0.018f, (Color){ 255, 220, 150, 220 });
+    DrawSphere((Vector3){ -a - c, 0.0f, 0.0f }, 0.018f, (Color){ 150, 200, 255, 200 });
 
-    // Planet position from yearPhase
+    // --- Planet position from yearPhase (mean anomaly approximation matches the sim's eccentric-radius math)
     float yearAngle = climate.yearPhase * 2.0f * PI;
-    Vector3 planetPos = { a * cosf(yearAngle) - ecc * a, 0.0f, b * sinf(yearAngle) };
-    DrawSphere(planetPos, 0.06f, (Color){ 130, 200, 255, 255 });
+    Vector3 planetPos = { a * cosf(yearAngle) - c, 0.0f, b * sinf(yearAngle) };
+    DrawSphere(planetPos, 0.05f, (Color){ 130, 200, 255, 255 });
 
-    // Tilt-axis marker on planet
+    // Planet axis (axial tilt)
     Vector3 axis = solar.northPole;
-    DrawLine3D(Vector3Add(planetPos, Vector3Scale(axis,  0.16f)),
-               Vector3Add(planetPos, Vector3Scale(axis, -0.16f)),
+    DrawLine3D(Vector3Add(planetPos, Vector3Scale(axis,  0.13f)),
+               Vector3Add(planetPos, Vector3Scale(axis, -0.13f)),
                (Color){ 220, 230, 255, 220 });
 
-    // Equatorial reference grid
-    for (int i = -2; i <= 2; i++) {
-        float r = 0.5f * (float)(i + 3);
-        DrawCircle3D((Vector3){ 0, 0, 0 }, r, (Vector3){ 1, 0, 0 }, 90.0f, (Color){ 48, 60, 88, 80 });
+    // --- Faint reference circles at integer AU
+    int maxAu = (int)ceilf(fmaxf(a + c + 0.5f, hzOut + 0.3f));
+    for (int i = 1; i <= maxAu; i++) {
+        DrawCircle3D((Vector3){ 0, 0, 0 }, (float)i,
+                     (Vector3){ 1, 0, 0 }, 90.0f,
+                     (Color){ 40, 56, 80, 70 });
     }
+
     EndMode3D();
     EndTextureMode();
 }
@@ -3476,7 +3511,7 @@ static void UiDrawOrbitMapWindow(const SolarState &solar, ClimateSettings &clima
     const char *maxLabel = g_ui.orbitMapMaximized ? "Restore" : "Maximize";
     if (ImGui::SmallButton(maxLabel)) g_ui.orbitMapMaximized = !g_ui.orbitMapMaximized;
     ImGui::SameLine();
-    if (ImGui::SmallButton("Focus planet")) g_ui.focusRequestPlanet = true;
+    if (ImGui::SmallButton("Fit")) g_ui.orbitAutoFit = true;
     ImGui::SameLine();
     ImGui::TextDisabled("drag rotate · scroll zoom");
 
@@ -3500,9 +3535,10 @@ static void UiDrawOrbitMapWindow(const SolarState &solar, ClimateSettings &clima
     if (ImGui::IsItemHovered()) {
         float wheel = ImGui::GetIO().MouseWheel;
         if (wheel != 0.0f) {
-            g_ui.orbitDistance *= powf(0.92f, wheel);
-            if (g_ui.orbitDistance < 0.8f) g_ui.orbitDistance = 0.8f;
-            if (g_ui.orbitDistance > 12.0f) g_ui.orbitDistance = 12.0f;
+            g_ui.orbitAutoFit = false;
+            g_ui.orbitDistance *= powf(0.88f, wheel);
+            if (g_ui.orbitDistance < 0.3f)   g_ui.orbitDistance = 0.3f;
+            if (g_ui.orbitDistance > 80.0f)  g_ui.orbitDistance = 80.0f;
         }
     }
 
@@ -3652,7 +3688,6 @@ int main(void)
             if (IsKeyPressed(KEY_W)) weatherEnabled = !weatherEnabled;
             if (IsKeyPressed(KEY_F1)) g_ui.uiVisible = !g_ui.uiVisible;
             if (IsKeyPressed(KEY_F2)) g_ui.showControls = !g_ui.showControls;
-            if (IsKeyPressed(KEY_F3)) g_ui.showInspector = !g_ui.showInspector;
             if (IsKeyPressed(KEY_F4)) g_ui.showCharts = !g_ui.showCharts;
             if (IsKeyPressed(KEY_F5)) g_ui.showLegend = !g_ui.showLegend;
             if (IsKeyPressed(KEY_F6)) g_ui.showOrbitMap = !g_ui.showOrbitMap;
@@ -3794,8 +3829,6 @@ int main(void)
             UiDrawChartsWindow(climateCharts, climate.yearPhase);
             UiDrawLegendWindow(weatherView, weatherEnabled, showPlateView);
             UiDrawOrbitMapWindow(solar, climate, orbit);
-            if (g_ui.showImGuiDemo) ImGui::ShowDemoWindow(&g_ui.showImGuiDemo);
-            if (g_ui.showImPlotDemo) ImPlot::ShowDemoWindow(&g_ui.showImPlotDemo);
         }
         rlImGuiEnd();
 

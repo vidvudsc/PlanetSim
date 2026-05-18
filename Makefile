@@ -10,6 +10,7 @@ IMPLOT_DIR  := vendor/implot
 RLIMGUI_DIR := vendor/rlImGui
 
 INCLUDES := -I$(IMGUI_DIR) -I$(IMPLOT_DIR) -I$(RLIMGUI_DIR)
+DEFINES  := -DNO_FONT_AWESOME
 
 IMGUI_SRC := \
 	$(IMGUI_DIR)/imgui.cpp \
@@ -33,7 +34,7 @@ endif
 all: $(APP)
 
 $(APP): $(SOURCES)
-	$(CXX) $(CXXFLAGS) $(RAYLIB_CFLAGS) $(INCLUDES) $(SOURCES) -o $(APP) $(RAYLIB_LIBS) $(FRAMEWORKS) -lm
+	$(CXX) $(CXXFLAGS) $(DEFINES) $(RAYLIB_CFLAGS) $(INCLUDES) $(SOURCES) -o $(APP) $(RAYLIB_LIBS) $(FRAMEWORKS) -lm
 
 clean:
 	rm -f $(APP)
