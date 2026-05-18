@@ -176,18 +176,6 @@ typedef struct ClimateSettings {
     float stellarLuminosity;
     float stellarTemperatureK;
     float greenhouseC;
-    float orbitDistanceRangeMin;
-    float orbitDistanceRangeMax;
-    float orbitEccentricityRangeMin;
-    float orbitEccentricityRangeMax;
-    float stellarLuminosityRangeMin;
-    float stellarLuminosityRangeMax;
-    float stellarTemperatureRangeMin;
-    float stellarTemperatureRangeMax;
-    float greenhouseRangeMin;
-    float greenhouseRangeMax;
-    float temperatureContrastRangeMin;
-    float temperatureContrastRangeMax;
     float weatherTimeScale;
     float temperatureContrast;
     float atmosphereDensityFalloff;
@@ -2137,8 +2125,10 @@ static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
 {
     switch (mode) {
         case WEATHER_VIEW_TEMPERATURE: {
+            float temperatureC = WeatherTemperatureC(w->temperature);
+            float scale = ClampFloat((temperatureC + 35.0f) / 80.0f, 0.0f, 1.0f);
             return Gradient3(
-                w->temperature,
+                scale,
                 (Color){ 60, 108, 172, 255 },
                 (Color){ 89, 158, 104, 255 },
                 (Color){ 209, 156, 86, 255 }
@@ -2232,8 +2222,10 @@ static Color GetWeatherViewColor(const WeatherCell *w, WeatherViewMode mode)
             );
         }
         case WEATHER_VIEW_OCEAN_TEMP: {
+            float oceanTemperatureC = WeatherTemperatureC(w->oceanTemperature);
+            float scale = ClampFloat((oceanTemperatureC + 2.0f) / 37.0f, 0.0f, 1.0f);
             return Gradient3(
-                w->oceanTemperature,
+                scale,
                 (Color){ 22, 42, 86, 255 },
                 (Color){ 44, 154, 214, 255 },
                 (Color){ 232, 80, 60, 255 }
@@ -2539,19 +2531,7 @@ static Vector3 AtmosphereScatterCoefficients(float strength)
     };
 }
 
-static void DrawBillboardDisc(Vector3 center, Vector3 right, Vector3 up, float radius, Color color, int segments)
-{
-    if (radius <= 0.0f || color.a == 0 || segments < 8) return;
-    for (int i = 0; i < segments; i++) {
-        float a0 = ((float)i / (float)segments) * 2.0f * PI;
-        float a1 = ((float)(i + 1) / (float)segments) * 2.0f * PI;
-        Vector3 p0 = Vector3Add(center, Vector3Add(Vector3Scale(right, cosf(a0) * radius), Vector3Scale(up, sinf(a0) * radius)));
-        Vector3 p1 = Vector3Add(center, Vector3Add(Vector3Scale(right, cosf(a1) * radius), Vector3Scale(up, sinf(a1) * radius)));
-        DrawTriangle3D(center, p1, p0, color);
-    }
-}
-
-static void DrawSunBillboard(Camera3D camera, const SolarState *solar)
+static void DrawSunBillboard(Camera3D camera, const SolarState *solar, Texture2D sunGlowTexture)
 {
     Vector3 lightDir = SunLightDirection(solar);
     Vector3 sunWorld = Vector3Scale(lightDir, 120.0f);
@@ -2573,27 +2553,10 @@ static void DrawSunBillboard(Camera3D camera, const SolarState *solar)
     Color warmCorona = LerpColor(star, (Color){ 255, 194, 112, 255 }, 0.28f);
     Color hotCore = LerpColor(star, (Color){ 255, 252, 232, 255 }, 0.72f);
 
-    rlDisableBackfaceCulling();
-    DrawBillboardDisc(sunWorld, right, up, haloRadius, (Color){ warmCorona.r, warmCorona.g, warmCorona.b, 18 }, 64);
-    DrawBillboardDisc(sunWorld, right, up, coreRadius * 3.0f, (Color){ star.r, star.g, star.b, 28 }, 64);
-
-    for (int i = 0; i < 18; i++) {
-        float angle = ((float)i / 18.0f) * 2.0f * PI;
-        float length = coreRadius * LerpFloat(2.8f, 5.8f, Hash2D01(i, 0, 131));
-        float width = coreRadius * LerpFloat(0.045f, 0.095f, Hash2D01(i, 0, 149));
-        Vector3 rayDir = Vector3Add(Vector3Scale(right, cosf(angle)), Vector3Scale(up, sinf(angle)));
-        Vector3 raySide = Vector3Add(Vector3Scale(right, -sinf(angle)), Vector3Scale(up, cosf(angle)));
-        Vector3 base = Vector3Add(sunWorld, Vector3Scale(rayDir, coreRadius * 1.22f));
-        Vector3 tip = Vector3Add(sunWorld, Vector3Scale(rayDir, length));
-        Vector3 p0 = Vector3Add(base, Vector3Scale(raySide, width));
-        Vector3 p1 = Vector3Subtract(base, Vector3Scale(raySide, width));
-        DrawTriangle3D(tip, p0, p1, (Color){ warmCorona.r, warmCorona.g, warmCorona.b, (unsigned char)LerpFloat(18.0f, 42.0f, Hash2D01(i, 0, 167)) });
-    }
-
-    DrawBillboardDisc(sunWorld, right, up, coreRadius * 1.36f, (Color){ star.r, star.g, star.b, 116 }, 64);
-    DrawBillboardDisc(sunWorld, right, up, coreRadius * 0.82f, (Color){ hotCore.r, hotCore.g, hotCore.b, 238 }, 64);
-    DrawBillboardDisc(Vector3Add(sunWorld, Vector3Add(Vector3Scale(right, -coreRadius * 0.18f), Vector3Scale(up, coreRadius * 0.18f))), right, up, coreRadius * 0.30f, (Color){ 255, 255, 250, 168 }, 32);
-    rlEnableBackfaceCulling();
+    Rectangle source = { 0.0f, 0.0f, (float)sunGlowTexture.width, (float)sunGlowTexture.height };
+    DrawBillboardPro(camera, sunGlowTexture, source, sunWorld, up, (Vector2){ haloRadius * 2.0f, haloRadius * 2.0f }, (Vector2){ haloRadius, haloRadius }, 0.0f, (Color){ warmCorona.r, warmCorona.g, warmCorona.b, 46 });
+    DrawBillboardPro(camera, sunGlowTexture, source, sunWorld, up, (Vector2){ coreRadius * 5.0f, coreRadius * 5.0f }, (Vector2){ coreRadius * 2.5f, coreRadius * 2.5f }, 0.0f, (Color){ star.r, star.g, star.b, 98 });
+    DrawBillboardPro(camera, sunGlowTexture, source, sunWorld, up, (Vector2){ coreRadius * 2.0f, coreRadius * 2.0f }, (Vector2){ coreRadius, coreRadius }, 0.0f, (Color){ hotCore.r, hotCore.g, hotCore.b, 246 });
 }
 
 static void DrawSunOrbitGuide(Camera3D camera, const SolarState *solar)
@@ -2927,10 +2890,14 @@ static void WeatherLegendLabels(WeatherViewMode mode, char *low, int lowSize, ch
 {
     switch (mode) {
         case WEATHER_VIEW_TEMPERATURE:
+            snprintf(low, (size_t)lowSize, "-35 C");
+            snprintf(mid, (size_t)midSize, "5 C");
+            snprintf(high, (size_t)highSize, "45+ C");
+            break;
         case WEATHER_VIEW_OCEAN_TEMP:
-            snprintf(low, (size_t)lowSize, "-120 C");
-            snprintf(mid, (size_t)midSize, "-12 C");
-            snprintf(high, (size_t)highSize, "95 C");
+            snprintf(low, (size_t)lowSize, "-2 C");
+            snprintf(mid, (size_t)midSize, "16 C");
+            snprintf(high, (size_t)highSize, "35+ C");
             break;
         case WEATHER_VIEW_PRESSURE:
             snprintf(low, (size_t)lowSize, "low 780 hPa");
@@ -3187,54 +3154,6 @@ static bool PanelSliderFloat(PanelLayout *layout, const char *label, float *valu
     return changed;
 }
 
-static void ExpandPanelSliderRange(float value, float *rangeMin, float *rangeMax, float floorValue, float ceilingValue, float minSpan)
-{
-    if (*rangeMax - *rangeMin < minSpan) {
-        *rangeMin = value - minSpan * 0.5f;
-        *rangeMax = value + minSpan * 0.5f;
-    }
-    if (value < *rangeMin) *rangeMin = value;
-    if (value > *rangeMax) *rangeMax = value;
-
-    float span = fmaxf(minSpan, *rangeMax - *rangeMin);
-    if (value < *rangeMin + span * 0.08f) *rangeMin -= span * 0.45f;
-    if (value > *rangeMax - span * 0.08f) *rangeMax += span * 0.45f;
-
-    if (floorValue > -FLT_MAX * 0.5f && *rangeMin < floorValue) *rangeMin = floorValue;
-    if (ceilingValue < FLT_MAX * 0.5f && *rangeMax > ceilingValue) *rangeMax = ceilingValue;
-    if (*rangeMax - *rangeMin < minSpan) {
-        float center = ClampFloat(value, *rangeMin, *rangeMax);
-        *rangeMin = center - minSpan * 0.5f;
-        *rangeMax = center + minSpan * 0.5f;
-        if (floorValue > -FLT_MAX * 0.5f && *rangeMin < floorValue) {
-            *rangeMax += floorValue - *rangeMin;
-            *rangeMin = floorValue;
-        }
-        if (ceilingValue < FLT_MAX * 0.5f && *rangeMax > ceilingValue) {
-            *rangeMin -= *rangeMax - ceilingValue;
-            *rangeMax = ceilingValue;
-        }
-    }
-}
-
-static bool PanelSliderFloatAutoRange(
-    PanelLayout *layout,
-    const char *label,
-    float *value,
-    float *rangeMin,
-    float *rangeMax,
-    float floorValue,
-    float ceilingValue,
-    float minSpan,
-    const char *format
-)
-{
-    ExpandPanelSliderRange(*value, rangeMin, rangeMax, floorValue, ceilingValue, minSpan);
-    bool changed = PanelSliderFloat(layout, label, value, *rangeMin, *rangeMax, format);
-    ExpandPanelSliderRange(*value, rangeMin, rangeMax, floorValue, ceilingValue, minSpan);
-    return changed;
-}
-
 static void PanelDrawWeatherViewSelector(PanelLayout *layout, WeatherViewMode *weatherView)
 {
     Rectangle row = PanelConsumeRect(layout, 28.0f);
@@ -3360,18 +3279,18 @@ static bool DrawControlPanel(
     PanelSliderFloat(&layout, "Year Speed", &climate->yearSpeed, 0.0f, 4.0f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Orbit");
-    PanelSliderFloatAutoRange(&layout, "Orbit Distance", &climate->orbitDistanceAu, &climate->orbitDistanceRangeMin, &climate->orbitDistanceRangeMax, 0.001f, FLT_MAX, 0.20f, "%.2f AU");
-    PanelSliderFloatAutoRange(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, &climate->orbitEccentricityRangeMin, &climate->orbitEccentricityRangeMax, 0.0f, 0.98f, 0.08f, "%.2f");
+    PanelSliderFloat(&layout, "Orbit Distance", &climate->orbitDistanceAu, 0.05f, 20.00f, "%.2f AU");
+    PanelSliderFloat(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, 0.0f, 0.85f, "%.2f");
     PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 89.0f, "%.1f deg");
 
     PanelDrawSectionTitle(&layout, "Star");
-    PanelSliderFloatAutoRange(&layout, "Star Luminosity", &climate->stellarLuminosity, &climate->stellarLuminosityRangeMin, &climate->stellarLuminosityRangeMax, 0.001f, FLT_MAX, 0.25f, "%.2f L");
-    PanelSliderFloatAutoRange(&layout, "Star Color Temp", &climate->stellarTemperatureK, &climate->stellarTemperatureRangeMin, &climate->stellarTemperatureRangeMax, 300.0f, FLT_MAX, 400.0f, "%.0f K");
+    PanelSliderFloat(&layout, "Star Luminosity", &climate->stellarLuminosity, 0.01f, 50.00f, "%.2f L");
+    PanelSliderFloat(&layout, "Star Color Temp", &climate->stellarTemperatureK, 1800.0f, 12000.0f, "%.0f K");
     PanelSliderFloat(&layout, "Sun Brightness", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Climate");
-    PanelSliderFloatAutoRange(&layout, "Greenhouse", &climate->greenhouseC, &climate->greenhouseRangeMin, &climate->greenhouseRangeMax, -FLT_MAX, FLT_MAX, 10.0f, "%.0f C");
-    PanelSliderFloatAutoRange(&layout, "Temp Contrast", &climate->temperatureContrast, &climate->temperatureContrastRangeMin, &climate->temperatureContrastRangeMax, 0.0f, FLT_MAX, 0.20f, "%.2fx");
+    PanelSliderFloat(&layout, "Greenhouse", &climate->greenhouseC, -30.0f, 65.0f, "%.0f C");
+    PanelSliderFloat(&layout, "Temp Contrast", &climate->temperatureContrast, 0.50f, 1.80f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Weather And Atmosphere");
     PanelSliderFloat(&layout, "Weather Speed", &climate->weatherTimeScale, 0.25f, 6.0f, "%.2fx");
@@ -3975,6 +3894,11 @@ int main(void)
     InitWindow(1280, 800, "Planet");
     SetTargetFPS(60);
 
+    Image sunGlowImage = GenImageGradientRadial(256, 256, 0.08f, WHITE, BLANK);
+    Texture2D sunGlowTexture = LoadTextureFromImage(sunGlowImage);
+    UnloadImage(sunGlowImage);
+    SetTextureFilter(sunGlowTexture, TEXTURE_FILTER_BILINEAR);
+
     Shader atmosphereShader = LoadShader("shaders/atmosphere.vs", "shaders/atmosphere.fs");
     int atmosphereScreenSizeLoc = GetShaderLocation(atmosphereShader, "screenSize");
     int atmosphereCameraPosLoc = GetShaderLocation(atmosphereShader, "cameraPos");
@@ -4009,18 +3933,6 @@ int main(void)
         .stellarLuminosity = 1.0f,
         .stellarTemperatureK = 5778.0f,
         .greenhouseC = 0.0f,
-        .orbitDistanceRangeMin = 0.20f,
-        .orbitDistanceRangeMax = 5.00f,
-        .orbitEccentricityRangeMin = 0.0f,
-        .orbitEccentricityRangeMax = 0.65f,
-        .stellarLuminosityRangeMin = 0.05f,
-        .stellarLuminosityRangeMax = 5.00f,
-        .stellarTemperatureRangeMin = 1800.0f,
-        .stellarTemperatureRangeMax = 12000.0f,
-        .greenhouseRangeMin = -30.0f,
-        .greenhouseRangeMax = 65.0f,
-        .temperatureContrastRangeMin = 0.50f,
-        .temperatureContrastRangeMax = 1.80f,
         .weatherTimeScale = WEATHER_TIME_SCALE,
         .temperatureContrast = 1.0f,
         .atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF,
@@ -4198,7 +4110,7 @@ int main(void)
         BeginTextureMode(sceneTexture);
         ClearBackground((Color){ 0, 0, 0, 0 });
         BeginMode3D(camera);
-        DrawSunBillboard(camera, &solar);
+        DrawSunBillboard(camera, &solar, sunGlowTexture);
         DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile, &solar);
         if (climate.showTiltAxis) DrawTiltAxisGuide(tiles, tileCount, &solar);
         if (!showPlateView && weatherEnabled) DrawWeatherClouds(tiles, weatherA, tileCount, weatherView);
@@ -4258,6 +4170,7 @@ int main(void)
     free(triangleDirections);
     free(triangles.items);
     free(vertices.items);
+    UnloadTexture(sunGlowTexture);
     UnloadRenderTexture(sceneTexture);
     UnloadShader(atmosphereShader);
 
