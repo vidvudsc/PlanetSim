@@ -163,6 +163,17 @@ typedef struct WeatherCell {
     float seasonalTemperatureMax;
 } WeatherCell;
 
+#define MAX_MOONS 4
+
+typedef struct MoonConfig {
+    bool enabled;
+    float distance;        // planet radii from planet centre
+    float period;          // sim days for one orbit
+    float radius;          // planet radii
+    float phase;           // 0..1 initial phase
+    float inclinationDeg;  // tilt vs planet equator
+} MoonConfig;
+
 typedef struct ClimateSettings {
     bool autoAdvanceTime;
     bool dayNightEnabled;
@@ -177,6 +188,7 @@ typedef struct ClimateSettings {
     float solarIntensity;
     float orbitDistanceAu;
     float orbitEccentricity;
+    float orbitInclinationDeg;
     float stellarLuminosity;
     float stellarTemperatureK;
     float greenhouseC;
@@ -184,6 +196,8 @@ typedef struct ClimateSettings {
     float temperatureContrast;
     float atmosphereDensityFalloff;
     float atmosphereScatteringScale;
+    int moonCount;
+    MoonConfig moons[MAX_MOONS];
 } ClimateSettings;
 
 typedef struct SolarState {
@@ -3072,6 +3086,26 @@ struct UiState {
 
 static UiState g_ui;
 
+static ImVec4 UiChartColor(WeatherViewMode mode)
+{
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE: return ImVec4(0.95f, 0.55f, 0.30f, 1.0f);
+        case WEATHER_VIEW_PRESSURE:    return ImVec4(0.42f, 0.62f, 0.94f, 1.0f);
+        case WEATHER_VIEW_WIND:        return ImVec4(0.92f, 0.91f, 0.55f, 1.0f);
+        case WEATHER_VIEW_CURRENT:     return ImVec4(0.30f, 0.78f, 0.94f, 1.0f);
+        case WEATHER_VIEW_HUMIDITY:    return ImVec4(0.36f, 0.78f, 0.48f, 1.0f);
+        case WEATHER_VIEW_CLOUD:       return ImVec4(0.80f, 0.85f, 0.92f, 1.0f);
+        case WEATHER_VIEW_RAIN:        return ImVec4(0.28f, 0.58f, 0.94f, 1.0f);
+        case WEATHER_VIEW_VORTICITY:   return ImVec4(0.86f, 0.42f, 0.45f, 1.0f);
+        case WEATHER_VIEW_STORM:       return ImVec4(0.74f, 0.58f, 0.96f, 1.0f);
+        case WEATHER_VIEW_EVAPORATION: return ImVec4(0.88f, 0.74f, 0.36f, 1.0f);
+        case WEATHER_VIEW_SNOW:        return ImVec4(0.91f, 0.96f, 0.99f, 1.0f);
+        case WEATHER_VIEW_OCEAN_TEMP:  return ImVec4(0.94f, 0.38f, 0.32f, 1.0f);
+        case WEATHER_VIEW_BIOME:       return ImVec4(0.34f, 0.72f, 0.33f, 1.0f);
+        default:                        return ImVec4(1, 1, 1, 1);
+    }
+}
+
 static void UiInit(void)
 {
     ImPlot::CreateContext();
@@ -3188,17 +3222,21 @@ static void UiDrawControlsWindow(ClimateSettings &climate,
 {
     if (!g_ui.showControls) return;
     ImGui::SetNextWindowPos(ImVec2(8, 60), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(440, 600), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Controls", &g_ui.showControls)) { ImGui::End(); return; }
+
+    const float kSlider = 180.0f;
 
     if (ImGui::BeginTabBar("##ctlTabs")) {
         if (ImGui::BeginTabItem("Sim")) {
             ImGui::Checkbox("Auto-advance time", &climate.autoAdvanceTime);
             ImGui::Checkbox("Day / night",       &climate.dayNightEnabled);
             ImGui::Checkbox("Seasons",           &climate.seasonsEnabled);
+            ImGui::PushItemWidth(kSlider);
             ImGui::SliderFloat("Day speed",      &climate.daySpeed,         0.0f, 4.0f, "%.2fx");
             ImGui::SliderFloat("Year speed",     &climate.yearSpeed,        0.0f, 4.0f, "%.2fx");
             ImGui::SliderFloat("Weather rate",   &climate.weatherTimeScale, 0.0f, 5.0f, "%.2fx");
+            ImGui::PopItemWidth();
             ImGui::Separator();
             ImGui::Checkbox("Weather enabled",  &weatherEnabled);
             ImGui::Checkbox("Tectonics paused", &tectonicsPaused);
@@ -3207,12 +3245,15 @@ static void UiDrawControlsWindow(ClimateSettings &climate,
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Star")) {
-            ImGui::SliderFloat("Luminosity",  &climate.stellarLuminosity, 0.05f, 4.0f, "%.2f Lsun");
-            ImGui::SliderFloat("Temperature", &climate.stellarTemperatureK, 2200.0f, 12000.0f, "%.0f K");
-            ImGui::SliderFloat("Orbit distance", &climate.orbitDistanceAu, 0.1f, 4.0f, "%.2f AU");
-            ImGui::SliderFloat("Eccentricity", &climate.orbitEccentricity, 0.0f, 0.85f, "%.3f");
-            ImGui::SliderFloat("Axial tilt",   &climate.axialTiltDegrees, 0.0f, 90.0f, "%.1f deg");
-            ImGui::SliderFloat("Solar intensity", &climate.solarIntensity, 0.0f, 3.0f, "%.2f");
+            ImGui::PushItemWidth(kSlider);
+            ImGui::SliderFloat("Luminosity",       &climate.stellarLuminosity,   0.05f, 4.0f,   "%.2f Lsun");
+            ImGui::SliderFloat("Temperature",      &climate.stellarTemperatureK, 2200.0f, 12000.0f, "%.0f K");
+            ImGui::SliderFloat("Orbit distance",   &climate.orbitDistanceAu,     0.1f, 4.0f,    "%.2f AU");
+            ImGui::SliderFloat("Eccentricity",     &climate.orbitEccentricity,   0.0f, 0.85f,   "%.3f");
+            ImGui::SliderFloat("Inclination",      &climate.orbitInclinationDeg, -45.0f, 45.0f, "%.1f deg");
+            ImGui::SliderFloat("Axial tilt",       &climate.axialTiltDegrees,    0.0f, 90.0f,   "%.1f deg");
+            ImGui::SliderFloat("Solar intensity",  &climate.solarIntensity,      0.0f, 3.0f,    "%.2f");
+            ImGui::PopItemWidth();
             ImGui::Separator();
             ImGui::Text("Flux: %.2f Ssun", solar.stellarFlux);
             ImGui::Text("Eq. temp: %.1f C", solar.equilibriumTemperatureC);
@@ -3224,10 +3265,36 @@ static void UiDrawControlsWindow(ClimateSettings &climate,
             ImGui::Checkbox("Atmosphere shader",  &atmosphereEnabled);
             ImGui::Checkbox("Show sun orbit",     &climate.showSunOrbit);
             ImGui::Checkbox("Show tilt axis",     &climate.showTiltAxis);
-            ImGui::SliderFloat("Greenhouse",     &climate.greenhouseC,            -10.0f, 30.0f, "%.1f C");
-            ImGui::SliderFloat("Temp contrast",  &climate.temperatureContrast,    0.4f, 2.0f, "%.2f");
-            ImGui::SliderFloat("Density falloff",&climate.atmosphereDensityFalloff,0.5f, 6.0f, "%.2f");
-            ImGui::SliderFloat("Scattering",     &climate.atmosphereScatteringScale,0.2f, 3.0f, "%.2f");
+            ImGui::PushItemWidth(kSlider);
+            ImGui::SliderFloat("Greenhouse",     &climate.greenhouseC,             -10.0f, 30.0f, "%.1f C");
+            ImGui::SliderFloat("Temp contrast",  &climate.temperatureContrast,     0.4f, 2.0f,   "%.2f");
+            ImGui::SliderFloat("Density falloff",&climate.atmosphereDensityFalloff,0.5f, 6.0f,   "%.2f");
+            ImGui::SliderFloat("Scattering",     &climate.atmosphereScatteringScale,0.2f, 3.0f,  "%.2f");
+            ImGui::PopItemWidth();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Moons")) {
+            ImGui::PushItemWidth(kSlider);
+            ImGui::SliderInt("Moon count", &climate.moonCount, 0, MAX_MOONS);
+            ImGui::PopItemWidth();
+            ImGui::TextDisabled("UI only for now; weather coupling lands in physics-rework.");
+            ImGui::Separator();
+            for (int i = 0; i < climate.moonCount; i++) {
+                MoonConfig &m = climate.moons[i];
+                ImGui::PushID(i);
+                ImGui::Text("Moon %d", i + 1);
+                ImGui::SameLine();
+                ImGui::Checkbox("##en", &m.enabled);
+                ImGui::PushItemWidth(kSlider);
+                ImGui::SliderFloat("Distance",    &m.distance,       1.5f, 30.0f, "%.1f Rp");
+                ImGui::SliderFloat("Period",      &m.period,         0.5f, 80.0f, "%.1f d");
+                ImGui::SliderFloat("Size",        &m.radius,         0.05f, 0.6f, "%.2f Rp");
+                ImGui::SliderFloat("Phase",       &m.phase,          0.0f, 1.0f,  "%.2f");
+                ImGui::SliderFloat("Inclination", &m.inclinationDeg, -60.0f, 60.0f, "%.1f deg");
+                ImGui::PopItemWidth();
+                ImGui::PopID();
+                ImGui::Separator();
+            }
             ImGui::EndTabItem();
         }
         if (ImGui::BeginTabItem("Render")) {
@@ -3276,21 +3343,44 @@ static void UiDrawInspectorWindow(const Tile *tiles, const Plate *plates, const 
     ImGui::Separator();
 
     if (ImPlot::BeginPlot("##insphist", ImVec2(-1, 160),
-                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText)) {
-        ImPlot::SetupAxes(nullptr, WeatherChartUnit(weatherView),
-                          ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoGridLines,
-                          ImPlotAxisFlags_AutoFit);
+                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
         int count = g_ui.inspHistCount;
+        float linear[UiState::InspectorBins];
+        float yMin = 0.0f, yMax = 1.0f;
         if (count > 1) {
-            float linear[UiState::InspectorBins];
             int start = (g_ui.inspHistHead - count + UiState::InspectorBins) % UiState::InspectorBins;
-            for (int i = 0; i < count; i++)
-                linear[i] = g_ui.inspHistory[(int)weatherView][(start + i) % UiState::InspectorBins];
-            ImPlot::PlotLine(WeatherViewShortName(weatherView), linear, count);
+            yMin = +1e30f; yMax = -1e30f;
+            for (int i = 0; i < count; i++) {
+                float v = g_ui.inspHistory[(int)weatherView][(start + i) % UiState::InspectorBins];
+                linear[i] = v;
+                if (v < yMin) yMin = v;
+                if (v > yMax) yMax = v;
+            }
+            float span = yMax - yMin;
+            float minSpan = fmaxf(1e-3f, fabsf(yMax) * 0.05f + 0.5f);
+            if (span < minSpan) {
+                float c = (yMin + yMax) * 0.5f;
+                yMin = c - minSpan * 0.5f;
+                yMax = c + minSpan * 0.5f;
+            } else {
+                float pad = span * 0.12f;
+                yMin -= pad; yMax += pad;
+            }
+        }
+        ImPlot::SetupAxes(nullptr, WeatherChartUnit(weatherView),
+                          ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoMenus,
+                          ImPlotAxisFlags_NoMenus);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, (double)(count > 1 ? count : 1), ImGuiCond_Always);
+        ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
+        if (count > 1) {
+            ImPlotSpec spec;
+            spec.LineColor = UiChartColor(weatherView);
+            spec.LineWeight = 2.0f;
+            ImPlot::PlotLine(WeatherViewShortName(weatherView), linear, count, 1.0, 0.0, spec);
         }
         ImPlot::EndPlot();
     }
-    ImGui::TextDisabled("History: %s · %d samples", WeatherViewName(weatherView), g_ui.inspHistCount);
+    ImGui::TextDisabled("%s  ·  %d samples", WeatherViewName(weatherView), g_ui.inspHistCount);
 
     ImGui::End();
 }
@@ -3328,14 +3418,14 @@ static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPha
     }
 
     if (ImPlot::BeginPlot("##chart", ImVec2(-1, -1),
-                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
+                          ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
         ImPlot::SetupAxes("year phase", WeatherChartUnit(g_ui.chartsMode),
-                          ImPlotAxisFlags_NoMenus,
-                          ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_NoMenus);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Always);
+                          ImPlotAxisFlags_None,
+                          ImPlotAxisFlags_AutoFit);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Once);
         if (n > 1) {
             ImPlotSpec spec;
-            spec.LineColor = ImVec4(0.42f, 0.78f, 1.0f, 1.0f);
+            spec.LineColor = UiChartColor(g_ui.chartsMode);
             spec.LineWeight = 2.0f;
             ImPlot::PlotLine(WeatherViewShortName(g_ui.chartsMode), xs, ys, n, spec);
         }
@@ -3407,6 +3497,7 @@ static void UiRenderOrbitMapTexture(const SolarState &solar, const ClimateSettin
         float extent = fmaxf(a + c, solar.habitableZoneOuterAu);
         g_ui.orbitDistance = extent * 2.4f + 0.6f;
     }
+    if (g_ui.orbitDistance < 0.3f) g_ui.orbitDistance = 0.3f;
 
     Camera3D cam{};
     Vector3 dir = {
@@ -3422,66 +3513,116 @@ static void UiRenderOrbitMapTexture(const SolarState &solar, const ClimateSettin
 
     BeginMode3D(cam);
 
-    // --- Real orbital elements (sun is at the FOCUS of the ellipse, not the centre)
-    float a   = fmaxf(0.05f, climate.orbitDistanceAu);          // semi-major axis [AU]
+    // --- Real orbital elements (sun at the FOCUS of the ellipse)
+    float a   = fmaxf(0.05f, climate.orbitDistanceAu);
     float ecc = ClampFloat(climate.orbitEccentricity, 0.0f, 0.85f);
-    float b   = a * sqrtf(fmaxf(0.0f, 1.0f - ecc * ecc));        // semi-minor axis
-    float c   = a * ecc;                                         // focal offset
+    float b   = a * sqrtf(fmaxf(0.0f, 1.0f - ecc * ecc));
+    float c   = a * ecc;
 
-    // --- Habitable zone as a fuzzy green annulus (many ring loops + filled discs at low alpha)
+    // Orbit-plane basis (tilted by orbitInclinationDeg around the +X axis = line of nodes)
+    float incl = climate.orbitInclinationDeg * DEG2RAD;
+    Vector3 ax = { 1.0f, 0.0f, 0.0f };
+    Vector3 ay = { 0.0f, sinf(incl), cosf(incl) };
+    auto orbitPoint = [&](float th) {
+        float px = a * cosf(th) - c;
+        float py = b * sinf(th);
+        return (Vector3){ ax.x * px + ay.x * py, ax.y * px + ay.y * py, ax.z * px + ay.z * py };
+    };
+
+    // --- Habitable zone (fuzzy green annulus in the SYSTEM reference plane, not the orbit plane)
     float hzIn  = solar.habitableZoneInnerAu;
     float hzOut = solar.habitableZoneOuterAu;
     if (hzOut > hzIn && hzOut > 0.01f) {
-        const int hzRings = 18;
+        const int hzRings = 22;
         for (int i = 0; i < hzRings; i++) {
             float t = (float)i / (float)(hzRings - 1);
             float r = LerpFloat(hzIn, hzOut, t);
-            float edge = fabsf(t - 0.5f) * 2.0f;     // 0 at centre, 1 at either edge
-            float falloff = 1.0f - edge * edge;      // smooth, peaks in the middle
-            unsigned char alpha = (unsigned char)(34.0f * falloff + 6.0f);
+            float edge = fabsf(t - 0.5f) * 2.0f;
+            float falloff = 1.0f - edge * edge;
+            unsigned char alpha = (unsigned char)(36.0f * falloff + 6.0f);
             DrawCircle3D((Vector3){ 0, 0, 0 }, r,
                          (Vector3){ 1, 0, 0 }, 90.0f,
                          (Color){ 90, 220, 130, alpha });
         }
     }
 
-    // --- Star at origin
-    Color starCol = solar.starColor;
-    DrawSphere((Vector3){ 0, 0, 0 }, 0.10f + 0.04f * sqrtf(climate.stellarLuminosity), starCol);
-    DrawSphereWires((Vector3){ 0, 0, 0 }, 0.13f + 0.04f * sqrtf(climate.stellarLuminosity), 8, 12, ColorAlpha(starCol, 0.35f));
-
-    // --- Planet orbit ellipse (in the orbit plane; star/focus at origin -> centre offset by -c along +X)
-    Vector3 prev{};
-    bool havePrev = false;
-    const int seg = 160;
-    for (int i = 0; i <= seg; i++) {
-        float th = (float)i / (float)seg * 2.0f * PI;
-        Vector3 p = { a * cosf(th) - c, 0.0f, b * sinf(th) };
-        if (havePrev) DrawLine3D(prev, p, (Color){ 130, 188, 240, 220 });
-        prev = p;
-        havePrev = true;
-    }
-    // Periapsis & apoapsis markers
-    DrawSphere((Vector3){  a - c, 0.0f, 0.0f }, 0.018f, (Color){ 255, 220, 150, 220 });
-    DrawSphere((Vector3){ -a - c, 0.0f, 0.0f }, 0.018f, (Color){ 150, 200, 255, 200 });
-
-    // --- Planet position from yearPhase (mean anomaly approximation matches the sim's eccentric-radius math)
-    float yearAngle = climate.yearPhase * 2.0f * PI;
-    Vector3 planetPos = { a * cosf(yearAngle) - c, 0.0f, b * sinf(yearAngle) };
-    DrawSphere(planetPos, 0.05f, (Color){ 130, 200, 255, 255 });
-
-    // Planet axis (axial tilt)
-    Vector3 axis = solar.northPole;
-    DrawLine3D(Vector3Add(planetPos, Vector3Scale(axis,  0.13f)),
-               Vector3Add(planetPos, Vector3Scale(axis, -0.13f)),
-               (Color){ 220, 230, 255, 220 });
-
-    // --- Faint reference circles at integer AU
+    // --- Integer-AU reference rings
     int maxAu = (int)ceilf(fmaxf(a + c + 0.5f, hzOut + 0.3f));
     for (int i = 1; i <= maxAu; i++) {
         DrawCircle3D((Vector3){ 0, 0, 0 }, (float)i,
                      (Vector3){ 1, 0, 0 }, 90.0f,
-                     (Color){ 40, 56, 80, 70 });
+                     (Color){ 36, 50, 72, 70 });
+    }
+
+    // --- Star: solid core + multi-layer corona for a real-ish look
+    Color starCol = solar.starColor;
+    float starR = 0.10f + 0.05f * sqrtf(climate.stellarLuminosity);
+    DrawSphere((Vector3){ 0, 0, 0 }, starR, starCol);
+    DrawSphere((Vector3){ 0, 0, 0 }, starR * 1.35f, ColorAlpha(starCol, 0.28f));
+    DrawSphere((Vector3){ 0, 0, 0 }, starR * 1.85f, ColorAlpha(starCol, 0.14f));
+    DrawSphere((Vector3){ 0, 0, 0 }, starR * 2.60f, ColorAlpha(starCol, 0.06f));
+
+    // --- Planet orbit ellipse in the tilted orbit plane
+    Vector3 prev{};
+    bool havePrev = false;
+    const int seg = 192;
+    for (int i = 0; i <= seg; i++) {
+        float th = (float)i / (float)seg * 2.0f * PI;
+        Vector3 p = orbitPoint(th);
+        if (havePrev) DrawLine3D(prev, p, (Color){ 130, 188, 240, 200 });
+        prev = p;
+        havePrev = true;
+    }
+
+    // --- Planet
+    float yearAngle = climate.yearPhase * 2.0f * PI;
+    Vector3 planetPos = orbitPoint(yearAngle);
+    float planetR = 0.055f;
+    Color planetCol = (Color){ 96, 168, 230, 255 };
+    DrawSphere(planetPos, planetR,          planetCol);
+    DrawSphere(planetPos, planetR * 1.35f,  ColorAlpha(planetCol, 0.18f));   // soft atmosphere halo
+    // Planet axis from real sim tilt
+    Vector3 axis = solar.northPole;
+    DrawLine3D(Vector3Add(planetPos, Vector3Scale(axis,  planetR * 2.4f)),
+               Vector3Add(planetPos, Vector3Scale(axis, -planetR * 2.4f)),
+               (Color){ 230, 240, 255, 220 });
+
+    // --- Moons: each orbits the PLANET, in a plane tilted by its inclination relative to the planet equator
+    if (climate.moonCount > 0) {
+        Vector3 planetEquatorX = Vector3Normalize(Vector3CrossProduct((Vector3){ 0, 1, 0 }, axis));
+        if (Vector3LengthSqr(planetEquatorX) < 1e-4f) planetEquatorX = (Vector3){ 1, 0, 0 };
+        Vector3 planetEquatorZ = Vector3Normalize(Vector3CrossProduct(axis, planetEquatorX));
+
+        for (int mi = 0; mi < climate.moonCount && mi < MAX_MOONS; mi++) {
+            const MoonConfig &m = climate.moons[mi];
+            if (!m.enabled) continue;
+            // Visual scale: 1 planet radius == planetR units in the orbit map
+            float moonOrbitR = m.distance * planetR;
+            float moonR      = fmaxf(0.010f, m.radius * planetR * 0.9f);
+            float mInc = m.inclinationDeg * DEG2RAD;
+            // Build a tilted moon-orbit basis around the planet's equatorial X axis
+            Vector3 mAx = planetEquatorX;
+            Vector3 mAy = Vector3Add(Vector3Scale(planetEquatorZ, cosf(mInc)),
+                                     Vector3Scale(axis,           sinf(mInc)));
+            const int mseg = 64;
+            Vector3 mprev{}; bool mhavePrev = false;
+            for (int i = 0; i <= mseg; i++) {
+                float th = (float)i / (float)mseg * 2.0f * PI;
+                Vector3 p = Vector3Add(planetPos,
+                            Vector3Add(Vector3Scale(mAx, moonOrbitR * cosf(th)),
+                                       Vector3Scale(mAy, moonOrbitR * sinf(th))));
+                if (mhavePrev) DrawLine3D(mprev, p, (Color){ 170, 170, 200, 140 });
+                mprev = p;
+                mhavePrev = true;
+            }
+            // Moon body
+            float dayPhase = climate.dayPhase;            // proxy for "time" since we don't yet have absolute days
+            float moonTh = (m.phase + dayPhase * (1.0f / fmaxf(0.25f, m.period))) * 2.0f * PI;
+            Vector3 moonPos = Vector3Add(planetPos,
+                              Vector3Add(Vector3Scale(mAx, moonOrbitR * cosf(moonTh)),
+                                         Vector3Scale(mAy, moonOrbitR * sinf(moonTh))));
+            DrawSphere(moonPos, moonR, (Color){ 220, 220, 230, 255 });
+        }
     }
 
     EndMode3D();
@@ -3607,7 +3748,15 @@ int main(void)
         .temperatureContrast = 1.0f,
         .atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF,
         .atmosphereScatteringScale = 1.0f,
+        .moonCount = 1,
+        .moons = {
+            { true, 4.5f, 12.0f, 0.27f, 0.00f, 5.0f },
+            { false, 7.0f, 22.0f, 0.18f, 0.30f, -10.0f },
+            { false, 10.0f, 38.0f, 0.14f, 0.65f, 18.0f },
+            { false, 14.0f, 60.0f, 0.10f, 0.85f, 0.0f },
+        },
     };
+    climate.orbitInclinationDeg = 0.0f;
     SolarState solar = BuildSolarState(&climate);
 
     Vector3 atmosphereScatterCoefficients = AtmosphereScatterCoefficients(ATMOSPHERE_SCATTERING_STRENGTH);
@@ -3677,10 +3826,10 @@ int main(void)
 
     while (!WindowShouldClose()) {
         ImGuiIO &io = ImGui::GetIO();
-        bool uiHovered = io.WantCaptureMouse || io.WantCaptureKeyboard;
+        bool uiHovered = io.WantCaptureMouse;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiHovered) clickStart = GetMousePosition();
 
-        if (!io.WantCaptureKeyboard) {
+        if (!io.WantTextInput) {
             if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
             if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
             if (IsKeyPressed(KEY_SPACE)) tectonicsPaused = !tectonicsPaused;
