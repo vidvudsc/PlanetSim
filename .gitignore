@@ -1,2 +1,5 @@
 planet
 *.o
+imgui.ini
+.DS_Store
+.vscode/

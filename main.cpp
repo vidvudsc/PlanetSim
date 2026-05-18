@@ -10,6 +10,11 @@
 #include <string.h>
 #include <time.h>
 
+#define NO_FONT_AWESOME
+#include "imgui.h"
+#include "implot.h"
+#include "rlImGui.h"
+
 #define PLANET_RADIUS 1.8f
 #define SEA_LEVEL 0.0f
 #define SUBDIVISIONS 5
@@ -159,7 +164,6 @@ typedef struct WeatherCell {
 } WeatherCell;
 
 typedef struct ClimateSettings {
-    bool panelOpen;
     bool autoAdvanceTime;
     bool dayNightEnabled;
     bool seasonsEnabled;
@@ -180,8 +184,6 @@ typedef struct ClimateSettings {
     float temperatureContrast;
     float atmosphereDensityFalloff;
     float atmosphereScatteringScale;
-    float panelScroll;
-    float panelContentHeight;
 } ClimateSettings;
 
 typedef struct SolarState {
@@ -244,15 +246,6 @@ typedef struct WeatherFlux {
     Vector3 current;
 } WeatherFlux;
 
-typedef struct PanelLayout {
-    Rectangle bounds;
-    Rectangle clipRect;
-    float cursorY;
-    float contentX;
-    float contentWidth;
-    float scrollY;
-} PanelLayout;
-
 typedef enum WeatherViewMode {
     WEATHER_VIEW_TEMPERATURE = 0,
     WEATHER_VIEW_PRESSURE,
@@ -285,7 +278,6 @@ static Vector3 TangentEastFromAxis(Vector3 normal, Vector3 climateNorth);
 static Vector3 TangentNorthFromAxis(Vector3 normal, Vector3 climateNorth);
 static Vector3 ClimateEddyFlowFromAxis(Vector3 normal, Vector3 climateNorth, float scale, Vector3 offset, float strength);
 static float MaxSurfaceRadius(const Tile *tiles, int tileCount);
-static Rectangle ControlPanelBounds(void);
 
 static float ClampFloat(float value, float minValue, float maxValue)
 {
@@ -2326,26 +2318,6 @@ static float WeatherChartMetricValue(const WeatherCell *w, WeatherViewMode mode)
     }
 }
 
-static Color WeatherChartLineColor(WeatherViewMode mode)
-{
-    switch (mode) {
-        case WEATHER_VIEW_TEMPERATURE: return (Color){ 232, 142, 78, 255 };
-        case WEATHER_VIEW_PRESSURE: return (Color){ 108, 158, 238, 255 };
-        case WEATHER_VIEW_WIND: return (Color){ 236, 232, 170, 255 };
-        case WEATHER_VIEW_CURRENT: return (Color){ 78, 198, 236, 255 };
-        case WEATHER_VIEW_HUMIDITY: return (Color){ 94, 184, 124, 255 };
-        case WEATHER_VIEW_CLOUD: return (Color){ 204, 216, 232, 255 };
-        case WEATHER_VIEW_RAIN: return (Color){ 72, 148, 238, 255 };
-        case WEATHER_VIEW_VORTICITY: return (Color){ 216, 108, 116, 255 };
-        case WEATHER_VIEW_STORM: return (Color){ 190, 148, 246, 255 };
-        case WEATHER_VIEW_EVAPORATION: return (Color){ 224, 190, 92, 255 };
-        case WEATHER_VIEW_SNOW: return (Color){ 232, 244, 252, 255 };
-        case WEATHER_VIEW_OCEAN_TEMP: return (Color){ 238, 96, 82, 255 };
-        case WEATHER_VIEW_BIOME: return (Color){ 88, 184, 84, 255 };
-        default: return (Color){ 255, 255, 255, 255 };
-    }
-}
-
 static float WeatherChartDisplayValue(WeatherViewMode mode, float normalized)
 {
     normalized = ClampFloat(normalized, 0.0f, 1.0f);
@@ -2389,57 +2361,6 @@ static const char *WeatherChartUnit(WeatherViewMode mode)
             return "mm/day";
         default:
             return "%";
-    }
-}
-
-static void FormatWeatherChartValue(WeatherViewMode mode, float normalized, char *buffer, int bufferSize)
-{
-    float value = WeatherChartDisplayValue(mode, normalized);
-    const char *unit = WeatherChartUnit(mode);
-    switch (mode) {
-        case WEATHER_VIEW_TEMPERATURE:
-        case WEATHER_VIEW_OCEAN_TEMP:
-        case WEATHER_VIEW_PRESSURE:
-        case WEATHER_VIEW_HUMIDITY:
-        case WEATHER_VIEW_CLOUD:
-        case WEATHER_VIEW_STORM:
-        case WEATHER_VIEW_SNOW:
-        case WEATHER_VIEW_BIOME:
-            snprintf(buffer, (size_t)bufferSize, "%.0f %s", value, unit);
-            break;
-        case WEATHER_VIEW_WIND:
-        case WEATHER_VIEW_CURRENT:
-        case WEATHER_VIEW_RAIN:
-        case WEATHER_VIEW_VORTICITY:
-        case WEATHER_VIEW_EVAPORATION:
-            snprintf(buffer, (size_t)bufferSize, "%.1f %s", value, unit);
-            break;
-        default:
-            snprintf(buffer, (size_t)bufferSize, "%.0f %s", value, unit);
-            break;
-    }
-}
-
-static float WeatherChartMinimumSpan(WeatherViewMode mode)
-{
-    switch (mode) {
-        case WEATHER_VIEW_TEMPERATURE:
-        case WEATHER_VIEW_OCEAN_TEMP:
-            return 8.0f / 90.0f;
-        case WEATHER_VIEW_PRESSURE:
-            return 24.0f / 525.0f;
-        case WEATHER_VIEW_WIND:
-            return 6.0f / 45.0f;
-        case WEATHER_VIEW_CURRENT:
-            return 0.55f / 3.0f;
-        case WEATHER_VIEW_RAIN:
-            return 1.0f / 7.0f;
-        case WEATHER_VIEW_VORTICITY:
-            return 1.2f / 8.0f;
-        case WEATHER_VIEW_EVAPORATION:
-            return 1.6f / 12.0f;
-        default:
-            return 0.14f;
     }
 }
 
@@ -2741,78 +2662,25 @@ static int PickTileFromMouse(const Tile *tiles, int tileCount, Camera3D camera)
     return bestTile;
 }
 
-static void DrawSelectedTileInfo(
-    const Tile *tiles,
-    const Plate *plates,
-    const WeatherCell *weather,
-    int tileCount,
-    int selectedTile,
-    bool tectonicsPaused,
-    bool weatherEnabled,
-    WeatherViewMode weatherView
-)
+
+static const char *WeatherChartDescription(WeatherViewMode mode)
 {
-    if (selectedTile < 0 || selectedTile >= tileCount) return;
-
-    const Tile *tile = &tiles[selectedTile];
-    const Plate *plate = &plates[tile->plateId];
-    const WeatherCell *w = &weather[selectedTile];
-    Vector3 normal = tile->baseCenterDir;
-    float elevationM = TerrainElevationMeters(tile->elevation);
-    float latitude = asinf(normal.y) * RAD2DEG;
-    float longitude = atan2f(normal.z, normal.x) * RAD2DEG;
-    float windSpeed = WeatherWindMetersPerSecond(w->wind);
-    float currentSpeed = WeatherCurrentMetersPerSecond(w->current);
-    float temperatureC = WeatherTemperatureC(w->temperature);
-    float surfaceTemperatureC = WeatherTemperatureC(w->surfaceTemperature);
-    float oceanTemperatureC = WeatherTemperatureC(w->oceanTemperature);
-    float pressureHpa = WeatherPressureHpa(w->pressure);
-    float humidityPct = WeatherRelativeHumidity(w->humidity, w->temperature) * 100.0f;
-    float cloudPct = ClampFloat(fmaxf(w->cloud, w->cloudWater), 0.0f, 1.0f) * 100.0f;
-    float precipitationMmH = w->precipitation * 25.0f;
-    float evaporationMmDay = w->evaporation * 12.0f;
-    float snowPct = ClampFloat(w->snow, 0.0f, 1.0f) * 100.0f;
-    float soilPct = ClampFloat(w->soilMoisture, 0.0f, 1.0f) * 100.0f;
-    float rainShadowPct = ClampFloat(w->rainShadow, 0.0f, 1.0f) * 100.0f;
-    float liftPct = ClampFloat(w->orographicLift, 0.0f, 1.0f) * 100.0f;
-    float vorticityE5 = w->vorticity * 8.0f;
-
-    DrawRectangle(14, 14, 460, 312, (Color){ 6, 10, 16, 198 });
-    DrawRectangleLines(14, 14, 460, 312, (Color){ 175, 189, 209, 180 });
-
-    int x = 26;
-    int y = 24;
-    int lh = 20;
-    char line[160];
-
-    snprintf(line, sizeof(line), "Tile %d  Plate %d  %s", selectedTile, tile->plateId + 1, plate->major ? "Major" : "Minor");
-    DrawText(line, x, y, 18, (Color){ 244, 248, 255, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Lat %.1f  Lon %.1f", latitude, longitude);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Elevation %.0f m", elevationM);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Oceanic %.2f  Density %.2f  Age %.2f", plate->oceanic, plate->density, plate->crustAge);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Temperature %.1f C", temperatureC);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Surface %.1f C  Ocean %.1f C", surfaceTemperatureC, oceanTemperatureC);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Pressure %.0f hPa", pressureHpa);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Humidity %.0f%%  Cloud %.0f%%", humidityPct, cloudPct);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Rain %.1fmm/h  Wind %.1fm/s  Cur %.2fm/s", precipitationMmH, windSpeed, currentSpeed);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Vort %.1f 1e-5/s  Front %.0f%%", vorticityE5, w->frontStrength * 100.0f);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Storm %.0f%%  Evap %.1fmm/day  Snow %.0f%%", w->storm * 100.0f, evaporationMmDay, snowPct);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Soil %.0f%%  Lift %.0f%%  Shadow %.0f%%", soilPct, liftPct, rainShadowPct);
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Tectonics %s  Weather %s", tectonicsPaused ? "Paused" : "Running", weatherEnabled ? "On" : "Off");
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 }); y += lh;
-    snprintf(line, sizeof(line), "Weather View: %s", WeatherViewName(weatherView));
-    DrawText(line, x, y, 18, (Color){ 210, 220, 236, 255 });
+    switch (mode) {
+        case WEATHER_VIEW_TEMPERATURE: return "global air temperature index";
+        case WEATHER_VIEW_PRESSURE: return "surface pressure index";
+        case WEATHER_VIEW_WIND: return "wind speed index";
+        case WEATHER_VIEW_CURRENT: return "ocean current speed index";
+        case WEATHER_VIEW_HUMIDITY: return "relative humidity index";
+        case WEATHER_VIEW_CLOUD: return "cloud and condensate coverage";
+        case WEATHER_VIEW_RAIN: return "rainfall and frontal precipitation";
+        case WEATHER_VIEW_VORTICITY: return "cyclonic/rotational activity";
+        case WEATHER_VIEW_STORM: return "storm lift and instability";
+        case WEATHER_VIEW_EVAPORATION: return "evaporation and drying";
+        case WEATHER_VIEW_SNOW: return "snow and ice coverage";
+        case WEATHER_VIEW_OCEAN_TEMP: return "ocean mixed-layer temperature";
+        case WEATHER_VIEW_BIOME: return "land greenness/moisture index";
+        default: return "weather index";
+    }
 }
 
 static void WeatherLegendPalette(WeatherViewMode mode, Color *low, Color *mid, Color *high)
@@ -2967,742 +2835,7 @@ static void WeatherLegendLabels(WeatherViewMode mode, char *low, int lowSize, ch
     }
 }
 
-static void DrawWeatherColorLegend(WeatherViewMode mode, bool weatherEnabled, bool showPlateView, bool panelOpen)
-{
-    if (!weatherEnabled || showPlateView) return;
 
-    float screenWidth = (float)GetScreenWidth();
-    float screenHeight = (float)GetScreenHeight();
-    float width = fminf(520.0f, screenWidth - 36.0f);
-    width = fmaxf(260.0f, width);
-    float height = 66.0f;
-    float bottomMargin = (screenHeight < 760.0f) ? 92.0f : 78.0f;
-    float x = (screenWidth - width) * 0.5f;
-    if (panelOpen) {
-        Rectangle panelBounds = ControlPanelBounds();
-        float panelClearX = panelBounds.x - 18.0f;
-        if (x + width > panelClearX) x = panelClearX - width;
-    }
-    Rectangle bounds = { fmaxf(18.0f, x), screenHeight - height - bottomMargin, width, height };
-    Rectangle bar = { bounds.x + 18.0f, bounds.y + 30.0f, bounds.width - 36.0f, 14.0f };
-
-    Color lowColor;
-    Color midColor;
-    Color highColor;
-    WeatherLegendPalette(mode, &lowColor, &midColor, &highColor);
-    DrawRectangleRounded(bounds, 0.12f, 8, (Color){ 5, 10, 17, 214 });
-    DrawRectangleRoundedLinesEx(bounds, 0.12f, 8, 1.0f, (Color){ 69, 101, 150, 190 });
-    DrawText(WeatherViewName(mode), (int)bounds.x + 18, (int)bounds.y + 9, 15, (Color){ 232, 240, 252, 255 });
-
-    int segments = 36;
-    for (int i = 0; i < segments; i++) {
-        float t0 = (float)i / (float)segments;
-        float t1 = (float)(i + 1) / (float)segments;
-        float x0 = bar.x + bar.width * t0;
-        float x1 = bar.x + bar.width * t1;
-        Color color = (t0 < 0.5f)
-            ? LerpColor(lowColor, midColor, t0 * 2.0f)
-            : LerpColor(midColor, highColor, (t0 - 0.5f) * 2.0f);
-        DrawRectangle((int)x0, (int)bar.y, (int)ceilf(x1 - x0), (int)bar.height, color);
-    }
-    DrawRectangleLinesEx(bar, 1.0f, (Color){ 190, 212, 238, 190 });
-
-    char low[32];
-    char mid[32];
-    char high[32];
-    WeatherLegendLabels(mode, low, (int)sizeof(low), mid, (int)sizeof(mid), high, (int)sizeof(high));
-    int midWidth = MeasureText(mid, 12);
-    int highWidth = MeasureText(high, 12);
-    DrawText(low, (int)bar.x, (int)(bar.y + bar.height + 6.0f), 12, (Color){ 184, 204, 230, 245 });
-    DrawText(mid, (int)(bar.x + bar.width * 0.5f - midWidth * 0.5f), (int)(bar.y + bar.height + 6.0f), 12, (Color){ 184, 204, 230, 245 });
-    DrawText(high, (int)(bar.x + bar.width - highWidth), (int)(bar.y + bar.height + 6.0f), 12, (Color){ 184, 204, 230, 245 });
-}
-
-static int gPanelActiveWidgetId = 0;
-static int gPanelNextWidgetId = 1;
-static Vector2 gClimateChartsPosition = { 28.0f, 36.0f };
-static Vector2 gClimateChartsSize = { 740.0f, 560.0f };
-static Vector2 gClimateChartsDragOffset = { 0.0f, 0.0f };
-static bool gClimateChartsPositionInitialized = false;
-
-static Rectangle ControlPanelBounds(void)
-{
-    float width = 418.0f;
-    float screenHeight = (float)GetScreenHeight();
-    float height = fmaxf(320.0f, screenHeight - 36.0f);
-    height = fminf(height, fmaxf(120.0f, screenHeight - 36.0f));
-    float x = fmaxf(18.0f, (float)GetScreenWidth() - width - 18.0f);
-    return (Rectangle){ x, 18.0f, width, height };
-}
-
-static Rectangle SidebarToggleBounds(bool panelOpen)
-{
-    if (panelOpen) {
-        Rectangle bounds = ControlPanelBounds();
-        return (Rectangle){ bounds.x + bounds.width - 42.0f, bounds.y + 10.0f, 28.0f, 28.0f };
-    }
-
-    float width = 40.0f;
-    float height = 118.0f;
-    float x = (float)GetScreenWidth() - width - 18.0f;
-    return (Rectangle){ x, 18.0f, width, height };
-}
-
-static void PanelBeginFrame(void)
-{
-    gPanelNextWidgetId = 1;
-}
-
-static int PanelNextWidgetId(void)
-{
-    return gPanelNextWidgetId++;
-}
-
-static Rectangle PanelConsumeRect(PanelLayout *layout, float height)
-{
-    Rectangle rect = { layout->contentX, layout->clipRect.y + layout->cursorY - layout->scrollY, layout->contentWidth, height };
-    layout->cursorY += height + 6.0f;
-    return rect;
-}
-
-static bool PanelIsInteractive(PanelLayout *layout, Rectangle rect)
-{
-    Vector2 mouse = GetMousePosition();
-    return CheckCollisionPointRec(mouse, rect) && CheckCollisionPointRec(mouse, layout->clipRect);
-}
-
-static void PanelDrawSectionTitle(PanelLayout *layout, const char *title)
-{
-    Rectangle rect = PanelConsumeRect(layout, 24.0f);
-    DrawRectangleRounded(rect, 0.06f, 6, (Color){ 19, 38, 68, 240 });
-    DrawRectangleRoundedLinesEx(rect, 0.06f, 6, 1.0f, (Color){ 52, 92, 150, 210 });
-    DrawText(title, (int)rect.x + 12, (int)rect.y + 3, 18, (Color){ 238, 244, 252, 255 });
-}
-
-static void PanelDrawTextRow(PanelLayout *layout, const char *left, const char *right)
-{
-    Rectangle rect = PanelConsumeRect(layout, 18.0f);
-    DrawText(left, (int)rect.x + 2, (int)rect.y, 17, (Color){ 214, 224, 239, 255 });
-    int valueWidth = MeasureText(right, 17);
-    DrawText(right, (int)(rect.x + rect.width - valueWidth), (int)rect.y, 17, (Color){ 176, 201, 233, 255 });
-}
-
-static bool PanelButton(PanelLayout *layout, const char *label)
-{
-    Rectangle rect = PanelConsumeRect(layout, 28.0f);
-    bool hovered = PanelIsInteractive(layout, rect);
-    int id = PanelNextWidgetId();
-    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
-    bool triggered = (gPanelActiveWidgetId == id && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT));
-    if (gPanelActiveWidgetId == id && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    Color fill = (gPanelActiveWidgetId == id && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) ? (Color){ 30, 74, 132, 255 }
-        : hovered ? (Color){ 26, 61, 110, 255 }
-        : (Color){ 18, 42, 78, 255 };
-    DrawRectangleRounded(rect, 0.08f, 8, fill);
-    DrawRectangleRoundedLinesEx(rect, 0.08f, 8, 1.0f, (Color){ 63, 119, 192, 220 });
-    int textWidth = MeasureText(label, 17);
-    DrawText(label, (int)(rect.x + rect.width * 0.5f - textWidth * 0.5f), (int)rect.y + 5, 17, (Color){ 238, 244, 252, 255 });
-    return triggered;
-}
-
-static bool PanelCheckbox(PanelLayout *layout, const char *label, bool *value)
-{
-    Rectangle rect = PanelConsumeRect(layout, 24.0f);
-    bool hovered = PanelIsInteractive(layout, rect);
-    int id = PanelNextWidgetId();
-    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
-    bool changed = false;
-    if (gPanelActiveWidgetId == id && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        *value = !*value;
-        changed = true;
-    }
-    if (gPanelActiveWidgetId == id && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    Rectangle box = { rect.x + 2.0f, rect.y + 2.0f, 18.0f, 18.0f };
-    DrawRectangleRounded(box, 0.12f, 6, *value ? (Color){ 44, 102, 178, 255 } : (Color){ 12, 21, 36, 255 });
-    DrawRectangleRoundedLinesEx(box, 0.12f, 6, 1.0f, hovered ? (Color){ 115, 176, 244, 255 } : (Color){ 71, 111, 168, 230 });
-    if (*value) {
-        DrawLineEx((Vector2){ box.x + 4.0f, box.y + 10.0f }, (Vector2){ box.x + 9.0f, box.y + 15.0f }, 2.5f, (Color){ 242, 247, 255, 255 });
-        DrawLineEx((Vector2){ box.x + 9.0f, box.y + 15.0f }, (Vector2){ box.x + 16.0f, box.y + 5.0f }, 2.5f, (Color){ 242, 247, 255, 255 });
-    }
-    DrawText(label, (int)rect.x + 32, (int)rect.y + 1, 17, hovered ? (Color){ 236, 242, 251, 255 } : (Color){ 214, 224, 239, 255 });
-    return changed;
-}
-
-static bool PanelSliderFloat(PanelLayout *layout, const char *label, float *value, float minValue, float maxValue, const char *format)
-{
-    Rectangle rect = PanelConsumeRect(layout, 34.0f);
-    Rectangle track = { rect.x, rect.y + 21.0f, rect.width, 6.0f };
-    Vector2 mouse = GetMousePosition();
-    int id = PanelNextWidgetId();
-    bool hovered = CheckCollisionPointRec(mouse, (Rectangle){ track.x - 4.0f, rect.y, track.width + 8.0f, rect.height }) && CheckCollisionPointRec(mouse, layout->clipRect);
-
-    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
-    bool changed = false;
-    if (gPanelActiveWidgetId == id) {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            float t = ClampFloat((mouse.x - track.x) / track.width, 0.0f, 1.0f);
-            *value = LerpFloat(minValue, maxValue, t);
-            changed = true;
-        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            gPanelActiveWidgetId = 0;
-        }
-    }
-
-    float t = (*value - minValue) / (maxValue - minValue);
-    t = ClampFloat(t, 0.0f, 1.0f);
-    float knobX = track.x + t * track.width;
-    char valueText[64];
-    snprintf(valueText, sizeof(valueText), format, *value);
-    DrawText(label, (int)rect.x + 2, (int)rect.y, 17, (Color){ 214, 224, 239, 255 });
-    int textWidth = MeasureText(valueText, 17);
-    DrawText(valueText, (int)(rect.x + rect.width - textWidth), (int)rect.y, 17, (Color){ 176, 201, 233, 255 });
-    DrawRectangleRounded(track, 0.5f, 8, (Color){ 12, 21, 36, 255 });
-    Rectangle fill = { track.x, track.y, track.width * t, track.height };
-    DrawRectangleRounded(fill, 0.5f, 8, (Color){ 47, 112, 194, 255 });
-    DrawCircleV((Vector2){ knobX, track.y + track.height * 0.5f }, 6.5f,
-        (gPanelActiveWidgetId == id) ? (Color){ 214, 236, 255, 255 } : hovered ? (Color){ 178, 220, 255, 255 } : (Color){ 132, 190, 244, 255 });
-    return changed;
-}
-
-static void PanelDrawWeatherViewSelector(PanelLayout *layout, WeatherViewMode *weatherView)
-{
-    Rectangle row = PanelConsumeRect(layout, 28.0f);
-    Rectangle left = { row.x, row.y, 36.0f, row.height };
-    Rectangle right = { row.x + row.width - 36.0f, row.y, 36.0f, row.height };
-    Rectangle center = { left.x + left.width + 8.0f, row.y, row.width - left.width - right.width - 16.0f, row.height };
-    int leftId = PanelNextWidgetId();
-    bool hoverLeft = PanelIsInteractive(layout, left);
-    if (hoverLeft && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = leftId;
-    if (gPanelActiveWidgetId == leftId && hoverLeft && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        *weatherView = (WeatherViewMode)((*weatherView + WEATHER_VIEW_COUNT - 1) % WEATHER_VIEW_COUNT);
-    }
-    if (gPanelActiveWidgetId == leftId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    int rightId = PanelNextWidgetId();
-    bool hoverRight = PanelIsInteractive(layout, right);
-    if (hoverRight && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = rightId;
-    if (gPanelActiveWidgetId == rightId && hoverRight && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        *weatherView = (WeatherViewMode)((*weatherView + 1) % WEATHER_VIEW_COUNT);
-    }
-    if (gPanelActiveWidgetId == rightId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    DrawRectangleRounded(left, 0.10f, 8, hoverLeft ? (Color){ 26, 61, 110, 255 } : (Color){ 18, 42, 78, 255 });
-    DrawRectangleRounded(right, 0.10f, 8, hoverRight ? (Color){ 26, 61, 110, 255 } : (Color){ 18, 42, 78, 255 });
-    DrawRectangleRounded(center, 0.08f, 8, (Color){ 12, 21, 36, 255 });
-    DrawRectangleRoundedLinesEx(left, 0.10f, 8, 1.0f, (Color){ 63, 119, 192, 220 });
-    DrawRectangleRoundedLinesEx(right, 0.10f, 8, 1.0f, (Color){ 63, 119, 192, 220 });
-    DrawRectangleRoundedLinesEx(center, 0.08f, 8, 1.0f, (Color){ 52, 92, 150, 210 });
-    DrawText("<", (int)left.x + 11, (int)left.y + 4, 17, (Color){ 238, 244, 252, 255 });
-    DrawText(">", (int)right.x + 11, (int)right.y + 4, 17, (Color){ 238, 244, 252, 255 });
-    const char *label = WeatherViewShortName(*weatherView);
-    int fontSize = 16;
-    int labelWidth = MeasureText(label, fontSize);
-    if (labelWidth > (int)center.width - 18) {
-        fontSize = 15;
-        labelWidth = MeasureText(label, fontSize);
-    }
-    DrawText(label, (int)(center.x + center.width * 0.5f - labelWidth * 0.5f), (int)center.y + 5, fontSize, (Color){ 238, 244, 252, 255 });
-}
-
-static bool DrawControlPanel(
-    ClimateSettings *climate,
-    bool *showPlateView,
-    bool *atmosphereEnabled,
-    bool *weatherEnabled,
-    bool *tectonicsPaused,
-    WeatherViewMode *weatherView,
-    bool *resetWeatherRequested,
-    bool *showClimateCharts,
-    const SolarState *solar
-)
-{
-    Rectangle bounds = ControlPanelBounds();
-    Vector2 mouse = GetMousePosition();
-    bool hovered = climate->panelOpen && CheckCollisionPointRec(mouse, bounds);
-    if (!climate->panelOpen) return false;
-
-    Rectangle clipRect = {
-        bounds.x + 16.0f,
-        bounds.y + 66.0f,
-        bounds.width - 44.0f,
-        bounds.height - 82.0f
-    };
-    float maxScroll = fmaxf(0.0f, climate->panelContentHeight - clipRect.height);
-    if (hovered) {
-        float wheel = GetMouseWheelMove();
-        if (wheel != 0.0f) climate->panelScroll = ClampFloat(climate->panelScroll - wheel * 34.0f, 0.0f, maxScroll);
-    }
-
-    PanelBeginFrame();
-    DrawRectangleRounded(bounds, 0.03f, 8, (Color){ 10, 14, 22, 240 });
-    DrawRectangleRoundedLinesEx(bounds, 0.03f, 8, 1.0f, (Color){ 41, 70, 119, 220 });
-    DrawRectangle((int)bounds.x, (int)bounds.y, (int)bounds.width, 52, (Color){ 16, 29, 52, 250 });
-    DrawText("Controls", (int)bounds.x + 16, (int)bounds.y + 14, 26, (Color){ 240, 245, 252, 255 });
-
-    Rectangle toggleRect = SidebarToggleBounds(true);
-    bool toggleHover = CheckCollisionPointRec(mouse, toggleRect);
-    if (toggleHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = -100;
-    if (gPanelActiveWidgetId == -100 && toggleHover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) climate->panelOpen = false;
-    if (gPanelActiveWidgetId == -100 && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-    DrawRectangleRounded(toggleRect, 0.18f, 6, toggleHover ? (Color){ 30, 66, 118, 255 } : (Color){ 20, 44, 80, 255 });
-    DrawRectangleRoundedLinesEx(toggleRect, 0.18f, 6, 1.0f, (Color){ 89, 144, 216, 220 });
-    DrawText("X", (int)toggleRect.x + 9, (int)toggleRect.y + 5, 18, (Color){ 238, 244, 252, 255 });
-
-    PanelLayout layout = {
-        .bounds = bounds,
-        .clipRect = clipRect,
-        .cursorY = 0.0f,
-        .contentX = clipRect.x + 6.0f,
-        .contentWidth = clipRect.width - 12.0f,
-        .scrollY = climate->panelScroll,
-    };
-
-    BeginScissorMode((int)clipRect.x, (int)clipRect.y, (int)clipRect.width, (int)clipRect.height);
-
-    char summary[96];
-    snprintf(summary, sizeof(summary), "Day %.2f   Year %.2f", climate->dayPhase, climate->yearPhase);
-    PanelDrawTextRow(&layout, "Solar Clock", summary);
-    snprintf(summary, sizeof(summary), "Sun %.0f deg", asinf(SolarFacingAmount(solar->lightDir, solar->northPole)) * RAD2DEG);
-    PanelDrawTextRow(&layout, "Declination", summary);
-    snprintf(summary, sizeof(summary), "%.2f AU  %.2fx flux", solar->orbitDistanceAu, solar->stellarFlux);
-    PanelDrawTextRow(&layout, "Orbit", summary);
-    snprintf(summary, sizeof(summary), "%s  %.1f C", ClimateOrbitStatus(solar), ClimateMeanSeaLevelTemperatureC(solar));
-    PanelDrawTextRow(&layout, "Climate", summary);
-    snprintf(summary, sizeof(summary), "FPS %.1f", GetFPS() * 1.0f);
-    PanelDrawTextRow(&layout, "Performance", summary);
-
-    PanelDrawSectionTitle(&layout, "Simulation");
-    PanelCheckbox(&layout, "Atmosphere", atmosphereEnabled);
-    PanelCheckbox(&layout, "Weather", weatherEnabled);
-    PanelCheckbox(&layout, "Plate View", showPlateView);
-    PanelCheckbox(&layout, "Pause Tectonics", tectonicsPaused);
-
-    PanelDrawSectionTitle(&layout, "Time");
-    PanelCheckbox(&layout, "Auto Advance Time", &climate->autoAdvanceTime);
-    PanelCheckbox(&layout, "Day/Night Heating", &climate->dayNightEnabled);
-    PanelCheckbox(&layout, "Seasonal Shift", &climate->seasonsEnabled);
-    PanelSliderFloat(&layout, "Day Phase", &climate->dayPhase, 0.0f, 1.0f, "%.2f");
-    climate->dayPhase = Wrap01(climate->dayPhase);
-    PanelSliderFloat(&layout, "Year Phase", &climate->yearPhase, 0.0f, 1.0f, "%.2f");
-    climate->yearPhase = Wrap01(climate->yearPhase);
-    PanelSliderFloat(&layout, "Day Speed", &climate->daySpeed, 0.0f, 4.0f, "%.2fx");
-    PanelSliderFloat(&layout, "Year Speed", &climate->yearSpeed, 0.0f, 4.0f, "%.2fx");
-
-    PanelDrawSectionTitle(&layout, "Orbit");
-    PanelSliderFloat(&layout, "Orbit Distance", &climate->orbitDistanceAu, 0.05f, 20.00f, "%.2f AU");
-    PanelSliderFloat(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, 0.0f, 0.85f, "%.2f");
-    PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 89.0f, "%.1f deg");
-
-    PanelDrawSectionTitle(&layout, "Star");
-    PanelSliderFloat(&layout, "Star Luminosity", &climate->stellarLuminosity, 0.01f, 50.00f, "%.2f L");
-    PanelSliderFloat(&layout, "Star Color Temp", &climate->stellarTemperatureK, 1800.0f, 12000.0f, "%.0f K");
-    PanelSliderFloat(&layout, "Sun Brightness", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
-
-    PanelDrawSectionTitle(&layout, "Climate");
-    PanelSliderFloat(&layout, "Greenhouse", &climate->greenhouseC, -30.0f, 65.0f, "%.0f C");
-    PanelSliderFloat(&layout, "Temp Contrast", &climate->temperatureContrast, 0.50f, 1.80f, "%.2fx");
-
-    PanelDrawSectionTitle(&layout, "Weather And Atmosphere");
-    PanelSliderFloat(&layout, "Weather Speed", &climate->weatherTimeScale, 0.25f, 6.0f, "%.2fx");
-    PanelSliderFloat(&layout, "Atmo Density", &climate->atmosphereDensityFalloff, 1.20f, 4.60f, "%.2f");
-    PanelSliderFloat(&layout, "Atmo Scatter", &climate->atmosphereScatteringScale, 0.25f, 2.40f, "%.2fx");
-    if (PanelButton(&layout, "Reset Weather To Current Climate")) *resetWeatherRequested = true;
-
-    PanelDrawSectionTitle(&layout, "Views");
-    PanelCheckbox(&layout, "Show Sun Orbit", &climate->showSunOrbit);
-    PanelCheckbox(&layout, "Show Tilt Axis", &climate->showTiltAxis);
-    PanelDrawWeatherViewSelector(&layout, weatherView);
-    if (PanelButton(&layout, *showClimateCharts ? "Hide Climate Charts" : "Pop Out Climate Charts")) {
-        *showClimateCharts = !*showClimateCharts;
-    }
-
-    EndScissorMode();
-
-    climate->panelContentHeight = layout.cursorY;
-    maxScroll = fmaxf(0.0f, climate->panelContentHeight - clipRect.height);
-    climate->panelScroll = ClampFloat(climate->panelScroll, 0.0f, maxScroll);
-
-    DrawRectangleRounded(clipRect, 0.03f, 6, (Color){ 0, 0, 0, 0 });
-    DrawRectangleLinesEx(clipRect, 1.0f, (Color){ 28, 45, 74, 180 });
-    if (maxScroll > 0.0f) {
-        Rectangle bar = { bounds.x + bounds.width - 14.0f, clipRect.y, 6.0f, clipRect.height };
-        float thumbHeight = fmaxf(28.0f, clipRect.height * (clipRect.height / climate->panelContentHeight));
-        float thumbTravel = bar.height - thumbHeight;
-        float thumbOffset = (maxScroll > 0.0f) ? (climate->panelScroll / maxScroll) * thumbTravel : 0.0f;
-        Rectangle thumb = { bar.x, bar.y + thumbOffset, bar.width, thumbHeight };
-        DrawRectangleRounded(bar, 0.5f, 8, (Color){ 12, 21, 36, 255 });
-        DrawRectangleRounded(thumb, 0.5f, 8, hovered ? (Color){ 84, 145, 222, 255 } : (Color){ 58, 110, 182, 255 });
-    }
-
-    return hovered;
-}
-
-static bool DrawCollapsedSidebarToggle(bool *panelOpen)
-{
-    Rectangle rect = SidebarToggleBounds(false);
-    Vector2 mouse = GetMousePosition();
-    bool hovered = CheckCollisionPointRec(mouse, rect);
-    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = -101;
-    bool opened = false;
-    if (gPanelActiveWidgetId == -101 && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        *panelOpen = true;
-        opened = true;
-    }
-    if (gPanelActiveWidgetId == -101 && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    DrawRectangleRounded(rect, 0.18f, 8, hovered ? (Color){ 18, 42, 78, 240 } : (Color){ 10, 20, 36, 240 });
-    DrawRectangleRoundedLinesEx(rect, 0.18f, 8, 1.0f, (Color){ 89, 144, 216, 220 });
-    DrawText(">", (int)rect.x + 12, (int)rect.y + 10, 20, (Color){ 238, 244, 252, 255 });
-    DrawText("UI", (int)rect.x + 9, (int)rect.y + 42, 18, (Color){ 214, 224, 239, 255 });
-    DrawText("Open", (int)rect.x + 4, (int)rect.y + 70, 16, (Color){ 176, 201, 233, 255 });
-    return hovered || opened;
-}
-
-static Rectangle ClimateChartsBounds(bool collapsed)
-{
-    float screenWidth = (float)GetScreenWidth();
-    float screenHeight = (float)GetScreenHeight();
-    float minWidth = fminf(560.0f, fmaxf(360.0f, screenWidth - 36.0f));
-    float minHeight = fminf(460.0f, fmaxf(390.0f, screenHeight - 36.0f));
-    float maxWidth = fmaxf(minWidth, screenWidth - 36.0f);
-    float maxHeight = fmaxf(minHeight, screenHeight - 36.0f);
-    if (!gClimateChartsPositionInitialized) {
-        gClimateChartsPosition = (Vector2){ 28.0f, 36.0f };
-        gClimateChartsSize = (Vector2){ fminf(740.0f, maxWidth), fminf(560.0f, maxHeight) };
-        gClimateChartsPositionInitialized = true;
-    }
-    gClimateChartsSize.x = ClampFloat(gClimateChartsSize.x, minWidth, maxWidth);
-    gClimateChartsSize.y = ClampFloat(gClimateChartsSize.y, minHeight, maxHeight);
-    float width = gClimateChartsSize.x;
-    float height = collapsed ? 48.0f : gClimateChartsSize.y;
-    gClimateChartsPosition.x = ClampFloat(gClimateChartsPosition.x, 8.0f, fmaxf(8.0f, screenWidth - width - 8.0f));
-    gClimateChartsPosition.y = ClampFloat(gClimateChartsPosition.y, 8.0f, fmaxf(8.0f, screenHeight - height - 8.0f));
-    return (Rectangle){ gClimateChartsPosition.x, gClimateChartsPosition.y, width, height };
-}
-
-static void DrawChartLineRange(Rectangle chart, const float *values, int bins, int startBin, float minValue, float maxValue, Color color, float thickness)
-{
-    if (bins <= 1) return;
-    float span = fmaxf(0.001f, maxValue - minValue);
-    Vector2 prev = { 0 };
-    bool havePrev = false;
-    for (int i = 0; i < bins; i++) {
-        int bin = (startBin + i) % bins;
-        float x = chart.x + ((float)i / (float)(bins - 1)) * chart.width;
-        float normalized = ClampFloat((values[bin] - minValue) / span, 0.0f, 1.0f);
-        float y = chart.y + (1.0f - normalized) * chart.height;
-        Vector2 p = { x, y };
-        if (havePrev) DrawLineEx(prev, p, thickness, color);
-        prev = p;
-        havePrev = true;
-    }
-}
-
-static void DrawChartLine(Rectangle chart, const float *values, int bins, int startBin, Color color, float thickness)
-{
-    DrawChartLineRange(chart, values, bins, startBin, 0.0f, 1.0f, color, thickness);
-}
-
-static void DrawChartFrame(Rectangle chart, int currentBin)
-{
-    DrawRectangleRounded(chart, 0.035f, 6, (Color){ 8, 15, 27, 235 });
-    DrawRectangleRoundedLinesEx(chart, 0.035f, 6, 1.0f, (Color){ 55, 83, 128, 210 });
-    for (int i = 1; i < 4; i++) {
-        float y = chart.y + chart.height * ((float)i / 4.0f);
-        DrawLineEx((Vector2){ chart.x, y }, (Vector2){ chart.x + chart.width, y }, 1.0f, (Color){ 54, 70, 96, 95 });
-    }
-    for (int i = 1; i < 4; i++) {
-        float x = chart.x + chart.width * ((float)i / 4.0f);
-        DrawLineEx((Vector2){ x, chart.y }, (Vector2){ x, chart.y + chart.height }, 1.0f, (Color){ 54, 70, 96, 75 });
-    }
-    if (currentBin >= 0) {
-        float t = (float)currentBin / (float)(CLIMATE_CHART_BINS - 1);
-        float x = chart.x + t * chart.width;
-        DrawLineEx((Vector2){ x, chart.y }, (Vector2){ x, chart.y + chart.height }, 2.0f, (Color){ 250, 252, 255, 120 });
-    }
-}
-
-static void DrawChartRelativeLabels(Rectangle chart, const char *xLabel)
-{
-    DrawText("high", (int)chart.x - 38, (int)chart.y - 2, 12, (Color){ 158, 180, 208, 235 });
-    DrawText("mid", (int)chart.x - 32, (int)(chart.y + chart.height * 0.5f - 6), 12, (Color){ 128, 150, 178, 220 });
-    DrawText("low", (int)chart.x - 32, (int)(chart.y + chart.height - 12), 12, (Color){ 158, 180, 208, 235 });
-    DrawText("relative trend", (int)chart.x + 8, (int)chart.y + 6, 13, (Color){ 178, 204, 234, 245 });
-    int xWidth = MeasureText(xLabel, 13);
-    DrawText(xLabel, (int)(chart.x + chart.width - xWidth), (int)(chart.y + chart.height + 8), 13, (Color){ 178, 204, 234, 245 });
-}
-
-static void ClimateChartRange(const ClimateChartHistory *history, WeatherViewMode mode, float *minOut, float *maxOut)
-{
-    int selected = (int)mode;
-    float minValue = history->initialized ? history->values[selected][0] : history->latest[selected];
-    float maxValue = minValue;
-    for (int i = 0; i < CLIMATE_CHART_BINS; i++) {
-        float value = history->values[selected][i];
-        minValue = fminf(minValue, value);
-        maxValue = fmaxf(maxValue, value);
-    }
-
-    float minimumSpan = WeatherChartMinimumSpan(mode);
-    float span = maxValue - minValue;
-    float center = (minValue + maxValue) * 0.5f;
-    if (span < minimumSpan) {
-        minValue = center - minimumSpan * 0.5f;
-        maxValue = center + minimumSpan * 0.5f;
-    } else {
-        float padding = span * 0.16f;
-        minValue -= padding;
-        maxValue += padding;
-    }
-
-    if (minValue < 0.0f) {
-        maxValue = fminf(1.0f, maxValue - minValue);
-        minValue = 0.0f;
-    }
-    if (maxValue > 1.0f) {
-        minValue = fmaxf(0.0f, minValue - (maxValue - 1.0f));
-        maxValue = 1.0f;
-    }
-    if (maxValue - minValue < 0.001f) maxValue = fminf(1.0f, minValue + 0.001f);
-
-    *minOut = minValue;
-    *maxOut = maxValue;
-}
-
-static void DrawChartMetricLabelsRange(Rectangle chart, WeatherViewMode mode, float minValue, float maxValue, const char *xLabel)
-{
-    char top[32];
-    char mid[32];
-    char low[32];
-    float midValue = (minValue + maxValue) * 0.5f;
-    FormatWeatherChartValue(mode, maxValue, top, (int)sizeof(top));
-    FormatWeatherChartValue(mode, midValue, mid, (int)sizeof(mid));
-    FormatWeatherChartValue(mode, minValue, low, (int)sizeof(low));
-    int topWidth = MeasureText(top, 12);
-    int midWidth = MeasureText(mid, 12);
-    int lowWidth = MeasureText(low, 12);
-    DrawText(top, (int)(chart.x - topWidth - 8), (int)chart.y - 2, 12, (Color){ 158, 180, 208, 235 });
-    DrawText(mid, (int)(chart.x - midWidth - 8), (int)(chart.y + chart.height * 0.5f - 6), 12, (Color){ 128, 150, 178, 220 });
-    DrawText(low, (int)(chart.x - lowWidth - 8), (int)(chart.y + chart.height - 12), 12, (Color){ 158, 180, 208, 235 });
-    char label[80];
-    snprintf(label, sizeof(label), "%s (%s, adaptive)", WeatherViewShortName(mode), WeatherChartUnit(mode));
-    DrawText(label, (int)chart.x + 8, (int)chart.y + 6, 13, (Color){ 178, 204, 234, 245 });
-    int xWidth = MeasureText(xLabel, 13);
-    DrawText(xLabel, (int)(chart.x + chart.width - xWidth), (int)(chart.y + chart.height + 8), 13, (Color){ 178, 204, 234, 245 });
-}
-
-static const char *WeatherChartDescription(WeatherViewMode mode)
-{
-    switch (mode) {
-        case WEATHER_VIEW_TEMPERATURE: return "global air temperature index";
-        case WEATHER_VIEW_PRESSURE: return "surface pressure index";
-        case WEATHER_VIEW_WIND: return "wind speed index";
-        case WEATHER_VIEW_CURRENT: return "ocean current speed index";
-        case WEATHER_VIEW_HUMIDITY: return "relative humidity index";
-        case WEATHER_VIEW_CLOUD: return "cloud and condensate coverage";
-        case WEATHER_VIEW_RAIN: return "rainfall and frontal precipitation";
-        case WEATHER_VIEW_VORTICITY: return "cyclonic/rotational activity";
-        case WEATHER_VIEW_STORM: return "storm lift and instability";
-        case WEATHER_VIEW_EVAPORATION: return "evaporation and drying";
-        case WEATHER_VIEW_SNOW: return "snow and ice coverage";
-        case WEATHER_VIEW_OCEAN_TEMP: return "ocean mixed-layer temperature";
-        case WEATHER_VIEW_BIOME: return "land greenness/moisture index";
-        default: return "weather index";
-    }
-}
-
-static bool ClimateMetricRow(Rectangle rect, WeatherViewMode mode, WeatherViewMode *selectedMode, const ClimateChartHistory *history)
-{
-    Vector2 mouse = GetMousePosition();
-    bool hovered = CheckCollisionPointRec(mouse, rect);
-    int id = -300 - (int)mode;
-    if (hovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = id;
-    bool selected = (*selectedMode == mode);
-    bool triggered = false;
-    if (gPanelActiveWidgetId == id && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        *selectedMode = mode;
-        selected = true;
-        triggered = true;
-    }
-    if (gPanelActiveWidgetId == id && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    Color fill = selected ? (Color){ 25, 58, 104, 242 }
-        : hovered ? (Color){ 18, 38, 68, 238 }
-        : (Color){ 10, 20, 34, 228 };
-    DrawRectangleRounded(rect, 0.08f, 6, fill);
-    DrawRectangleRoundedLinesEx(rect, 0.08f, 6, 1.0f, selected ? (Color){ 112, 172, 238, 220 } : (Color){ 42, 66, 104, 180 });
-    Color color = WeatherChartLineColor(mode);
-    DrawRectangle((int)rect.x + 9, (int)rect.y + 9, 10, 10, color);
-    DrawText(WeatherViewShortName(mode), (int)rect.x + 26, (int)rect.y + 5, 14, (Color){ 226, 236, 250, 255 });
-    char latest[24];
-    float latestValue = history->initialized ? history->latest[(int)mode] : 0.0f;
-    FormatWeatherChartValue(mode, latestValue, latest, (int)sizeof(latest));
-    int latestWidth = MeasureText(latest, 13);
-    DrawText(latest, (int)(rect.x + rect.width - latestWidth - 10), (int)rect.y + 7, 13, (Color){ 166, 194, 226, 255 });
-    return triggered;
-}
-
-static bool DrawClimateChartsPopup(
-    bool *open,
-    bool *collapsed,
-    const ClimateChartHistory *history,
-    WeatherViewMode *selectedMode,
-    float yearPhase
-)
-{
-    if (!*open) return false;
-
-    Rectangle bounds = ClimateChartsBounds(*collapsed);
-    Vector2 mouse = GetMousePosition();
-    bool hovered = CheckCollisionPointRec(mouse, bounds);
-    int dragId = -221;
-    int resizeId = -222;
-    int collapseId = -223;
-    Rectangle dragRect = { bounds.x, bounds.y, bounds.width - 82.0f, 48.0f };
-    Rectangle resizeRect = { bounds.x + bounds.width - 24.0f, bounds.y + bounds.height - 24.0f, 18.0f, 18.0f };
-    bool dragHover = CheckCollisionPointRec(mouse, dragRect);
-    bool resizeHover = !*collapsed && CheckCollisionPointRec(mouse, resizeRect);
-    if (resizeHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        gPanelActiveWidgetId = resizeId;
-        gClimateChartsDragOffset = (Vector2){ bounds.x + bounds.width - mouse.x, bounds.y + bounds.height - mouse.y };
-    } else if (dragHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
-        gPanelActiveWidgetId = dragId;
-        gClimateChartsDragOffset = (Vector2){ mouse.x - bounds.x, mouse.y - bounds.y };
-    }
-    if (gPanelActiveWidgetId == dragId) {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            gClimateChartsPosition = (Vector2){ mouse.x - gClimateChartsDragOffset.x, mouse.y - gClimateChartsDragOffset.y };
-            bounds = ClimateChartsBounds(*collapsed);
-            dragRect = (Rectangle){ bounds.x, bounds.y, bounds.width - 82.0f, 48.0f };
-            resizeRect = (Rectangle){ bounds.x + bounds.width - 24.0f, bounds.y + bounds.height - 24.0f, 18.0f, 18.0f };
-        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            gPanelActiveWidgetId = 0;
-        }
-    }
-    if (gPanelActiveWidgetId == resizeId) {
-        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
-            gClimateChartsSize = (Vector2){
-                mouse.x - bounds.x + gClimateChartsDragOffset.x,
-                mouse.y - bounds.y + gClimateChartsDragOffset.y
-            };
-            bounds = ClimateChartsBounds(*collapsed);
-            dragRect = (Rectangle){ bounds.x, bounds.y, bounds.width - 82.0f, 48.0f };
-            resizeRect = (Rectangle){ bounds.x + bounds.width - 24.0f, bounds.y + bounds.height - 24.0f, 18.0f, 18.0f };
-        } else if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-            gPanelActiveWidgetId = 0;
-        }
-    }
-    int closeId = -220;
-    Rectangle closeRect = { bounds.x + bounds.width - 38.0f, bounds.y + 10.0f, 26.0f, 26.0f };
-    Rectangle collapseRect = { closeRect.x - 34.0f, bounds.y + 10.0f, 26.0f, 26.0f };
-    bool closeHover = CheckCollisionPointRec(mouse, closeRect);
-    bool collapseHover = CheckCollisionPointRec(mouse, collapseRect);
-    if (collapseHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = collapseId;
-    if (gPanelActiveWidgetId == collapseId && collapseHover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) *collapsed = !*collapsed;
-    if (gPanelActiveWidgetId == collapseId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-    if (closeHover && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = closeId;
-    if (gPanelActiveWidgetId == closeId && closeHover && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) *open = false;
-    if (gPanelActiveWidgetId == closeId && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) gPanelActiveWidgetId = 0;
-
-    DrawRectangleRounded(bounds, 0.025f, 8, (Color){ 7, 10, 17, 246 });
-    DrawRectangleRoundedLinesEx(bounds, 0.025f, 8, 1.0f, (Color){ 66, 99, 152, 230 });
-    DrawRectangle((int)bounds.x, (int)bounds.y, (int)bounds.width, 48, (Color){ 15, 29, 52, 250 });
-    DrawText("Planet Weather Cycles", (int)bounds.x + 18, (int)bounds.y + 13, 24, (Color){ 242, 247, 255, 255 });
-    char phaseText[64];
-    int dayOfYear = 1 + (int)(Wrap01(yearPhase) * 365.0f);
-    if (dayOfYear > 365) dayOfYear = 365;
-    snprintf(phaseText, sizeof(phaseText), "Day %d", dayOfYear);
-    int phaseWidth = MeasureText(phaseText, 16);
-    DrawText(phaseText, (int)(collapseRect.x - phaseWidth - 18), (int)bounds.y + 18, 16, (Color){ 172, 198, 232, 255 });
-    DrawRectangleRounded(collapseRect, 0.18f, 6, collapseHover ? (Color){ 38, 78, 132, 255 } : (Color){ 20, 44, 80, 255 });
-    DrawText(*collapsed ? "+" : "-", (int)collapseRect.x + 8, (int)collapseRect.y + 3, 19, (Color){ 238, 244, 252, 255 });
-    DrawRectangleRounded(closeRect, 0.18f, 6, closeHover ? (Color){ 38, 78, 132, 255 } : (Color){ 20, 44, 80, 255 });
-    DrawText("X", (int)closeRect.x + 8, (int)closeRect.y + 4, 17, (Color){ 238, 244, 252, 255 });
-    if (*collapsed) return hovered;
-
-    DrawLineEx((Vector2){ resizeRect.x + 4.0f, resizeRect.y + 16.0f }, (Vector2){ resizeRect.x + 16.0f, resizeRect.y + 4.0f }, 2.0f, resizeHover ? (Color){ 210, 232, 255, 255 } : (Color){ 112, 150, 196, 220 });
-    DrawLineEx((Vector2){ resizeRect.x + 9.0f, resizeRect.y + 16.0f }, (Vector2){ resizeRect.x + 16.0f, resizeRect.y + 9.0f }, 2.0f, resizeHover ? (Color){ 210, 232, 255, 255 } : (Color){ 112, 150, 196, 220 });
-
-    float margin = 18.0f;
-    int selected = (int)(*selectedMode);
-    int currentBin = (int)(Wrap01(yearPhase) * (float)CLIMATE_CHART_BINS);
-    if (currentBin >= CLIMATE_CHART_BINS) currentBin = CLIMATE_CHART_BINS - 1;
-    int currentMarker = CLIMATE_CHART_BINS - 1;
-
-    Rectangle summary = { bounds.x + margin + 42.0f, bounds.y + 86.0f, bounds.width - margin * 2.0f - 42.0f, 106.0f };
-    DrawText("Summary", (int)summary.x, (int)summary.y - 24, 17, (Color){ 220, 230, 244, 255 });
-    DrawChartFrame(summary, currentMarker);
-    char dayLabel[64];
-    snprintf(dayLabel, sizeof(dayLabel), "year cycle -> day %d", dayOfYear);
-    DrawChartRelativeLabels(summary, dayLabel);
-
-    int startBin = (currentBin + 1) % CLIMATE_CHART_BINS;
-    const WeatherViewMode summaryModes[] = {
-        WEATHER_VIEW_TEMPERATURE,
-        WEATHER_VIEW_HUMIDITY,
-        WEATHER_VIEW_CLOUD,
-        WEATHER_VIEW_RAIN,
-        WEATHER_VIEW_WIND,
-        WEATHER_VIEW_SNOW
-    };
-    if (history->initialized) {
-        for (int i = 0; i < (int)(sizeof(summaryModes) / sizeof(summaryModes[0])); i++) {
-            int mode = (int)summaryModes[i];
-            Color color = WeatherChartLineColor(summaryModes[i]);
-            color.a = 205;
-            DrawChartLine(summary, history->values[mode], CLIMATE_CHART_BINS, startBin, color, 1.8f);
-        }
-    }
-
-    float legendX = summary.x;
-    float legendY = summary.y + summary.height + 18.0f;
-    for (int i = 0; i < (int)(sizeof(summaryModes) / sizeof(summaryModes[0])); i++) {
-        WeatherViewMode mode = summaryModes[i];
-        Color color = WeatherChartLineColor(mode);
-        Rectangle swatch = { legendX, legendY, 9.0f, 9.0f };
-        DrawRectangleRec(swatch, color);
-        DrawText(WeatherViewShortName(mode), (int)swatch.x + 13, (int)swatch.y - 3, 12, (Color){ 178, 198, 224, 235 });
-        legendX += 96.0f;
-    }
-
-    float contentTop = legendY + 34.0f;
-    float listWidth = 230.0f;
-    Rectangle listBounds = { bounds.x + margin, contentTop, listWidth, bounds.y + bounds.height - contentTop - margin };
-    Rectangle detail = { listBounds.x + listWidth + 72.0f, contentTop + 64.0f, bounds.x + bounds.width - (listBounds.x + listWidth + 72.0f) - margin, listBounds.height - 104.0f };
-
-    DrawText("Metric", (int)listBounds.x, (int)listBounds.y - 24, 17, (Color){ 220, 230, 244, 255 });
-    DrawText("latest", (int)(listBounds.x + listBounds.width - 46), (int)listBounds.y - 21, 12, (Color){ 148, 174, 204, 235 });
-    float rowStep = fminf(25.0f, listBounds.height / (float)WEATHER_VIEW_COUNT);
-    float rowHeight = fmaxf(16.0f, rowStep - 3.0f);
-    for (int mode = 0; mode < WEATHER_VIEW_COUNT; mode++) {
-        Rectangle row = { listBounds.x, listBounds.y + (float)mode * rowStep, listBounds.width, rowHeight };
-        ClimateMetricRow(row, (WeatherViewMode)mode, selectedMode, history);
-    }
-
-    selected = (int)(*selectedMode);
-    Color selectedColor = WeatherChartLineColor(*selectedMode);
-    DrawRectangle((int)detail.x, (int)contentTop, 12, 12, selectedColor);
-    DrawText(WeatherViewName(*selectedMode), (int)detail.x + 18, (int)contentTop - 4, 20, (Color){ 238, 244, 252, 255 });
-    DrawText(WeatherChartDescription(*selectedMode), (int)detail.x, (int)contentTop + 20, 14, (Color){ 164, 190, 220, 245 });
-    char latestText[64];
-    float latestValue = history->initialized ? history->latest[selected] : 0.0f;
-    char valueText[32];
-    FormatWeatherChartValue(*selectedMode, latestValue, valueText, (int)sizeof(valueText));
-    snprintf(latestText, sizeof(latestText), "current %s", valueText);
-    int latestWidth = MeasureText(latestText, 15);
-    DrawText(latestText, (int)(detail.x + detail.width - latestWidth), (int)contentTop + 2, 15, (Color){ 190, 214, 242, 255 });
-
-    float rangeMin = 0.0f;
-    float rangeMax = 1.0f;
-    ClimateChartRange(history, *selectedMode, &rangeMin, &rangeMax);
-    DrawChartFrame(detail, currentMarker);
-    DrawChartMetricLabelsRange(detail, *selectedMode, rangeMin, rangeMax, dayLabel);
-    if (history->initialized) DrawChartLineRange(detail, history->values[selected], CLIMATE_CHART_BINS, startBin, rangeMin, rangeMax, selectedColor, 3.0f);
-
-    return hovered;
-}
 
 static void DrawWeatherClouds(
     const Tile *tiles,
@@ -3898,6 +3031,493 @@ static void DrawCurrentVectors(const Tile *tiles, const WeatherCell *weather, in
     }
 }
 
+// ============================================================
+// ImGui-based UI
+// ============================================================
+
+struct UiState {
+    bool uiVisible = true;
+
+    bool showControls = true;
+    bool showInspector = true;
+    bool showCharts = false;
+    bool showLegend = true;
+    bool showOrbitMap = true;
+    bool showImGuiDemo = false;
+    bool showImPlotDemo = false;
+
+    // Orbit map
+    bool orbitMapMaximized = false;
+    float orbitYaw = 0.7f;
+    float orbitPitch = 0.55f;
+    float orbitDistance = 3.4f;
+    RenderTexture2D orbitTex{};
+    int orbitTexW = 0;
+    int orbitTexH = 0;
+
+    // Inspector sparkline ring buffer
+    static const int InspectorBins = 256;
+    float inspHistory[WEATHER_VIEW_COUNT][InspectorBins]{};
+    int inspHistHead = 0;
+    int inspHistCount = 0;
+    int inspHistTile = -1;
+    bool inspHistSampledThisFrame = false;
+
+    // Charts metric
+    WeatherViewMode chartsMode = WEATHER_VIEW_TEMPERATURE;
+
+    // Camera focus requests from orbit map
+    bool focusRequestPlanet = false;
+
+    float uiAlpha = 1.0f;
+};
+
+static UiState g_ui;
+
+static void UiInit(void)
+{
+    ImPlot::CreateContext();
+    g_ui.orbitTexW = 360;
+    g_ui.orbitTexH = 240;
+    g_ui.orbitTex = LoadRenderTexture(g_ui.orbitTexW, g_ui.orbitTexH);
+    SetTextureFilter(g_ui.orbitTex.texture, TEXTURE_FILTER_BILINEAR);
+
+    ImGuiIO &io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = "imgui.ini";
+
+    ImGuiStyle &s = ImGui::GetStyle();
+    s.WindowRounding    = 6.0f;
+    s.FrameRounding     = 4.0f;
+    s.GrabRounding      = 4.0f;
+    s.TabRounding       = 4.0f;
+    s.PopupRounding     = 4.0f;
+    s.ScrollbarRounding = 6.0f;
+    s.WindowPadding     = ImVec2(10, 8);
+    s.FramePadding      = ImVec2(8, 4);
+    s.ItemSpacing       = ImVec2(8, 6);
+    s.Colors[ImGuiCol_WindowBg]      = ImVec4(0.08f, 0.10f, 0.14f, 0.92f);
+    s.Colors[ImGuiCol_TitleBg]       = ImVec4(0.10f, 0.13f, 0.18f, 1.00f);
+    s.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.14f, 0.20f, 0.30f, 1.00f);
+    s.Colors[ImGuiCol_Header]        = ImVec4(0.18f, 0.32f, 0.52f, 0.55f);
+    s.Colors[ImGuiCol_HeaderHovered] = ImVec4(0.22f, 0.40f, 0.66f, 0.75f);
+    s.Colors[ImGuiCol_HeaderActive]  = ImVec4(0.26f, 0.46f, 0.74f, 0.95f);
+    s.Colors[ImGuiCol_Button]        = ImVec4(0.18f, 0.30f, 0.48f, 0.85f);
+    s.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.24f, 0.42f, 0.68f, 0.95f);
+    s.Colors[ImGuiCol_ButtonActive]  = ImVec4(0.30f, 0.52f, 0.80f, 1.00f);
+}
+
+static void UiShutdown(void)
+{
+    UnloadRenderTexture(g_ui.orbitTex);
+    ImPlot::DestroyContext();
+}
+
+static void UiEnsureOrbitTextureSize(int w, int h)
+{
+    if (w < 32) w = 32;
+    if (h < 32) h = 32;
+    if (abs(w - g_ui.orbitTexW) < 8 && abs(h - g_ui.orbitTexH) < 8) return;
+    UnloadRenderTexture(g_ui.orbitTex);
+    g_ui.orbitTexW = w;
+    g_ui.orbitTexH = h;
+    g_ui.orbitTex = LoadRenderTexture(w, h);
+    SetTextureFilter(g_ui.orbitTex.texture, TEXTURE_FILTER_BILINEAR);
+}
+
+static void UiPushInspectorSample(const WeatherCell *w, int selectedTile)
+{
+    if (selectedTile != g_ui.inspHistTile) {
+        g_ui.inspHistTile = selectedTile;
+        g_ui.inspHistHead = 0;
+        g_ui.inspHistCount = 0;
+        memset(g_ui.inspHistory, 0, sizeof(g_ui.inspHistory));
+    }
+    if (selectedTile < 0 || !w) return;
+    int idx = g_ui.inspHistHead;
+    for (int m = 0; m < WEATHER_VIEW_COUNT; m++) {
+        float v = WeatherChartMetricValue(w, (WeatherViewMode)m);
+        g_ui.inspHistory[m][idx] = WeatherChartDisplayValue((WeatherViewMode)m, v);
+    }
+    g_ui.inspHistHead = (g_ui.inspHistHead + 1) % UiState::InspectorBins;
+    if (g_ui.inspHistCount < UiState::InspectorBins) g_ui.inspHistCount++;
+}
+
+static void UiDrawTopBar(ClimateSettings &climate, int simHz)
+{
+    ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.78f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoResize |
+                             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10, 6));
+    if (ImGui::Begin("##topbar", nullptr, flags)) {
+        int day = (int)floorf(climate.yearPhase * 360.0f);
+        float hourF = climate.dayPhase * 24.0f;
+        int hour = (int)floorf(hourF);
+        int minute = (int)floorf((hourF - hour) * 60.0f);
+        ImGui::Text("Year 1  Day %03d  %02d:%02d", day + 1, hour, minute);
+        ImGui::SameLine();
+        ImGui::TextDisabled(" | %d FPS / %d Hz sim", GetFPS(), simHz);
+        ImGui::SameLine();
+        const char *playLabel = climate.autoAdvanceTime ? "Pause" : "Play";
+        if (ImGui::SmallButton(playLabel)) climate.autoAdvanceTime = !climate.autoAdvanceTime;
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Panels  v")) ImGui::OpenPopup("PanelsMenu");
+        if (ImGui::BeginPopup("PanelsMenu")) {
+            ImGui::MenuItem("Controls",    "F2", &g_ui.showControls);
+            ImGui::MenuItem("Inspector",   "F3", &g_ui.showInspector);
+            ImGui::MenuItem("Charts",      "F4", &g_ui.showCharts);
+            ImGui::MenuItem("Legend",      "F5", &g_ui.showLegend);
+            ImGui::MenuItem("Orbit map",   "F6", &g_ui.showOrbitMap);
+            ImGui::Separator();
+            ImGui::MenuItem("ImGui demo",  nullptr, &g_ui.showImGuiDemo);
+            ImGui::MenuItem("ImPlot demo", nullptr, &g_ui.showImPlotDemo);
+            ImGui::Separator();
+            ImGui::SetNextItemWidth(140);
+            ImGui::SliderFloat("UI alpha", &g_ui.uiAlpha, 0.20f, 1.0f, "%.2f");
+            ImGui::EndPopup();
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar();
+}
+
+static void UiDrawControlsWindow(ClimateSettings &climate,
+                                 bool &atmosphereEnabled,
+                                 bool &weatherEnabled,
+                                 bool &tectonicsPaused,
+                                 bool &showPlateView,
+                                 WeatherViewMode &weatherView,
+                                 bool &resetWeatherRequested,
+                                 const SolarState &solar)
+{
+    if (!g_ui.showControls) return;
+    ImGui::SetNextWindowPos(ImVec2(8, 60), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Controls", &g_ui.showControls)) { ImGui::End(); return; }
+
+    if (ImGui::BeginTabBar("##ctlTabs")) {
+        if (ImGui::BeginTabItem("Sim")) {
+            ImGui::Checkbox("Auto-advance time", &climate.autoAdvanceTime);
+            ImGui::Checkbox("Day / night",       &climate.dayNightEnabled);
+            ImGui::Checkbox("Seasons",           &climate.seasonsEnabled);
+            ImGui::SliderFloat("Day speed",      &climate.daySpeed,         0.0f, 4.0f, "%.2fx");
+            ImGui::SliderFloat("Year speed",     &climate.yearSpeed,        0.0f, 4.0f, "%.2fx");
+            ImGui::SliderFloat("Weather rate",   &climate.weatherTimeScale, 0.0f, 5.0f, "%.2fx");
+            ImGui::Separator();
+            ImGui::Checkbox("Weather enabled",  &weatherEnabled);
+            ImGui::Checkbox("Tectonics paused", &tectonicsPaused);
+            ImGui::SameLine();
+            if (ImGui::Button("Reset weather")) resetWeatherRequested = true;
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Star")) {
+            ImGui::SliderFloat("Luminosity",  &climate.stellarLuminosity, 0.05f, 4.0f, "%.2f Lsun");
+            ImGui::SliderFloat("Temperature", &climate.stellarTemperatureK, 2200.0f, 12000.0f, "%.0f K");
+            ImGui::SliderFloat("Orbit distance", &climate.orbitDistanceAu, 0.1f, 4.0f, "%.2f AU");
+            ImGui::SliderFloat("Eccentricity", &climate.orbitEccentricity, 0.0f, 0.85f, "%.3f");
+            ImGui::SliderFloat("Axial tilt",   &climate.axialTiltDegrees, 0.0f, 90.0f, "%.1f deg");
+            ImGui::SliderFloat("Solar intensity", &climate.solarIntensity, 0.0f, 3.0f, "%.2f");
+            ImGui::Separator();
+            ImGui::Text("Flux: %.2f Ssun", solar.stellarFlux);
+            ImGui::Text("Eq. temp: %.1f C", solar.equilibriumTemperatureC);
+            ImGui::Text("HZ: %.2f - %.2f AU", solar.habitableZoneInnerAu, solar.habitableZoneOuterAu);
+            ImGui::TextDisabled("%s", ClimateOrbitStatus(&solar));
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Atmosphere")) {
+            ImGui::Checkbox("Atmosphere shader",  &atmosphereEnabled);
+            ImGui::Checkbox("Show sun orbit",     &climate.showSunOrbit);
+            ImGui::Checkbox("Show tilt axis",     &climate.showTiltAxis);
+            ImGui::SliderFloat("Greenhouse",     &climate.greenhouseC,            -10.0f, 30.0f, "%.1f C");
+            ImGui::SliderFloat("Temp contrast",  &climate.temperatureContrast,    0.4f, 2.0f, "%.2f");
+            ImGui::SliderFloat("Density falloff",&climate.atmosphereDensityFalloff,0.5f, 6.0f, "%.2f");
+            ImGui::SliderFloat("Scattering",     &climate.atmosphereScatteringScale,0.2f, 3.0f, "%.2f");
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Render")) {
+            ImGui::Checkbox("Plate view", &showPlateView);
+            ImGui::Separator();
+            ImGui::TextDisabled("Weather visualization");
+            for (int i = 0; i < WEATHER_VIEW_COUNT; i++) {
+                bool selected = ((int)weatherView == i);
+                if (ImGui::Selectable(WeatherViewName((WeatherViewMode)i), selected))
+                    weatherView = (WeatherViewMode)i;
+            }
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::End();
+}
+
+static void UiDrawInspectorWindow(const Tile *tiles, const Plate *plates, const WeatherCell *weather,
+                                  int tileCount, int selectedTile, WeatherViewMode weatherView)
+{
+    (void)plates;
+    if (!g_ui.showInspector) return;
+    int sw = GetScreenWidth();
+    ImGui::SetNextWindowPos(ImVec2((float)(sw - 328), 60.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(320, 480), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Tile inspector", &g_ui.showInspector)) { ImGui::End(); return; }
+    if (selectedTile < 0 || selectedTile >= tileCount) {
+        ImGui::TextDisabled("Click a tile on the globe to inspect.");
+        ImGui::End();
+        return;
+    }
+    const Tile &t = tiles[selectedTile];
+    const WeatherCell &w = weather[selectedTile];
+    Vector3 n = Vector3Normalize(t.baseCenterDir);
+    float lat = asinf(n.y) * RAD2DEG;
+    float lon = atan2f(n.z, n.x) * RAD2DEG;
+
+    ImGui::Text("Tile %d   Plate %d", selectedTile, t.plateId);
+    ImGui::Text("Lat %+5.1f deg   Lon %+6.1f deg", lat, lon);
+    ImGui::Text("Elevation %.0f m", TerrainElevationMeters(t.elevation));
+    ImGui::Separator();
+    ImGui::Text("Temperature  %6.1f C",   WeatherTemperatureC(w.temperature));
+    ImGui::Text("Pressure     %6.1f hPa", WeatherPressureHpa(w.pressure));
+    ImGui::Text("Humidity     %5.0f %%",  WeatherRelativeHumidity(w.humidity, w.temperature) * 100.0f);
+    ImGui::Text("Cloud cover  %5.0f %%",  ClampFloat(w.cloudWater, 0.0f, 1.0f) * 100.0f);
+    ImGui::Text("Wind         %5.1f m/s", WeatherWindMetersPerSecond(w.wind));
+    ImGui::Text("Ocean curr   %5.2f m/s", WeatherCurrentMetersPerSecond(w.current));
+    ImGui::Separator();
+
+    if (ImPlot::BeginPlot("##insphist", ImVec2(-1, 160),
+                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText)) {
+        ImPlot::SetupAxes(nullptr, WeatherChartUnit(weatherView),
+                          ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoGridLines,
+                          ImPlotAxisFlags_AutoFit);
+        int count = g_ui.inspHistCount;
+        if (count > 1) {
+            float linear[UiState::InspectorBins];
+            int start = (g_ui.inspHistHead - count + UiState::InspectorBins) % UiState::InspectorBins;
+            for (int i = 0; i < count; i++)
+                linear[i] = g_ui.inspHistory[(int)weatherView][(start + i) % UiState::InspectorBins];
+            ImPlot::PlotLine(WeatherViewShortName(weatherView), linear, count);
+        }
+        ImPlot::EndPlot();
+    }
+    ImGui::TextDisabled("History: %s · %d samples", WeatherViewName(weatherView), g_ui.inspHistCount);
+
+    ImGui::End();
+}
+
+static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPhase)
+{
+    if (!g_ui.showCharts) return;
+    int sh = GetScreenHeight();
+    ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 320)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(560, 300), ImGuiCond_FirstUseEver);
+    if (!ImGui::Begin("Climate charts", &g_ui.showCharts)) { ImGui::End(); return; }
+
+    if (ImGui::BeginCombo("Metric", WeatherViewName(g_ui.chartsMode))) {
+        for (int i = 0; i < WEATHER_VIEW_COUNT; i++) {
+            bool s = ((int)g_ui.chartsMode == i);
+            if (ImGui::Selectable(WeatherViewName((WeatherViewMode)i), s))
+                g_ui.chartsMode = (WeatherViewMode)i;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled(" %s", WeatherChartDescription(g_ui.chartsMode));
+
+    float xs[CLIMATE_CHART_BINS];
+    float ys[CLIMATE_CHART_BINS];
+    int n = 0;
+    for (int b = 0; b < CLIMATE_CHART_BINS; b++) {
+        if (history.sampleCounts[b] > 0.0f) {
+            xs[n] = (float)b / (float)CLIMATE_CHART_BINS;
+            ys[n] = WeatherChartDisplayValue(g_ui.chartsMode, history.values[(int)g_ui.chartsMode][b]);
+            n++;
+        }
+    }
+
+    if (ImPlot::BeginPlot("##chart", ImVec2(-1, -1),
+                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText)) {
+        ImPlot::SetupAxes("Year fraction", WeatherChartUnit(g_ui.chartsMode),
+                          ImPlotAxisFlags_None,
+                          ImPlotAxisFlags_AutoFit);
+        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Always);
+        if (n > 1) ImPlot::PlotLine(WeatherViewShortName(g_ui.chartsMode), xs, ys, n);
+        double cur = yearPhase;
+        ImPlot::PlotInfLines("##now", &cur, 1);
+        ImPlot::EndPlot();
+    }
+    ImGui::End();
+}
+
+static void UiDrawLegendWindow(WeatherViewMode weatherView, bool weatherEnabled, bool showPlateView)
+{
+    if (!g_ui.showLegend) return;
+    if (showPlateView || !weatherEnabled) return;
+
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+    ImGui::SetNextWindowPos(ImVec2((float)(sw - 248), (float)(sh - 116)), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(240, 100), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowBgAlpha(0.78f);
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
+                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize;
+    if (!ImGui::Begin("##legend", &g_ui.showLegend, flags)) { ImGui::End(); return; }
+
+    Color low, mid, high;
+    WeatherLegendPalette(weatherView, &low, &mid, &high);
+    char lowText[32], midText[32], highText[32];
+    WeatherLegendLabels(weatherView, lowText, sizeof(lowText), midText, sizeof(midText), highText, sizeof(highText));
+
+    ImGui::Text("%s", WeatherViewName(weatherView));
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float w = ImGui::GetContentRegionAvail().x;
+    float h = 14.0f;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    int steps = 32;
+    for (int i = 0; i < steps; i++) {
+        float t0 = (float)i / (float)steps;
+        float t1 = (float)(i + 1) / (float)steps;
+        Color a = (t0 < 0.5f) ? LerpColor(low, mid, t0 * 2.0f) : LerpColor(mid, high, (t0 - 0.5f) * 2.0f);
+        Color b = (t1 < 0.5f) ? LerpColor(low, mid, t1 * 2.0f) : LerpColor(mid, high, (t1 - 0.5f) * 2.0f);
+        ImU32 ca = IM_COL32(a.r, a.g, a.b, 255);
+        ImU32 cb = IM_COL32(b.r, b.g, b.b, 255);
+        dl->AddRectFilledMultiColor(
+            ImVec2(p.x + t0 * w, p.y),
+            ImVec2(p.x + t1 * w, p.y + h),
+            ca, cb, cb, ca);
+    }
+    ImGui::Dummy(ImVec2(w, h));
+    ImGui::Text("%s", lowText);
+    ImGui::SameLine(w * 0.5f - ImGui::CalcTextSize(midText).x * 0.5f);
+    ImGui::Text("%s", midText);
+    ImGui::SameLine(w - ImGui::CalcTextSize(highText).x);
+    ImGui::Text("%s", highText);
+
+    ImGui::End();
+}
+
+static void UiRenderOrbitMapTexture(const SolarState &solar, const ClimateSettings &climate)
+{
+    BeginTextureMode(g_ui.orbitTex);
+    ClearBackground((Color){ 8, 11, 22, 255 });
+
+    Camera3D cam{};
+    Vector3 dir = {
+        cosf(g_ui.orbitPitch) * cosf(g_ui.orbitYaw),
+        sinf(g_ui.orbitPitch),
+        cosf(g_ui.orbitPitch) * sinf(g_ui.orbitYaw)
+    };
+    cam.position = Vector3Scale(dir, g_ui.orbitDistance);
+    cam.target = (Vector3){ 0.0f, 0.0f, 0.0f };
+    cam.up = (Vector3){ 0.0f, 1.0f, 0.0f };
+    cam.fovy = 36.0f;
+    cam.projection = CAMERA_PERSPECTIVE;
+
+    BeginMode3D(cam);
+    // Star at origin
+    Color starCol = solar.starColor;
+    DrawSphere((Vector3){ 0, 0, 0 }, 0.18f, starCol);
+    DrawSphereWires((Vector3){ 0, 0, 0 }, 0.22f, 8, 12, ColorAlpha(starCol, 0.35f));
+
+    // Planet orbit ellipse in the equatorial plane of the SYSTEM (not the planet)
+    float ecc = ClampFloat(climate.orbitEccentricity, 0.0f, 0.85f);
+    float a = 1.0f;
+    float b = a * sqrtf(fmaxf(0.0f, 1.0f - ecc * ecc));
+    Vector3 prev{};
+    bool havePrev = false;
+    const int seg = 128;
+    for (int i = 0; i <= seg; i++) {
+        float th = (float)i / (float)seg * 2.0f * PI;
+        Vector3 p = { a * cosf(th) - ecc * a, 0.0f, b * sinf(th) };
+        if (havePrev) DrawLine3D(prev, p, (Color){ 120, 178, 232, 200 });
+        prev = p;
+        havePrev = true;
+    }
+
+    // Planet position from yearPhase
+    float yearAngle = climate.yearPhase * 2.0f * PI;
+    Vector3 planetPos = { a * cosf(yearAngle) - ecc * a, 0.0f, b * sinf(yearAngle) };
+    DrawSphere(planetPos, 0.06f, (Color){ 130, 200, 255, 255 });
+
+    // Tilt-axis marker on planet
+    Vector3 axis = solar.northPole;
+    DrawLine3D(Vector3Add(planetPos, Vector3Scale(axis,  0.16f)),
+               Vector3Add(planetPos, Vector3Scale(axis, -0.16f)),
+               (Color){ 220, 230, 255, 220 });
+
+    // Equatorial reference grid
+    for (int i = -2; i <= 2; i++) {
+        float r = 0.5f * (float)(i + 3);
+        DrawCircle3D((Vector3){ 0, 0, 0 }, r, (Vector3){ 1, 0, 0 }, 90.0f, (Color){ 48, 60, 88, 80 });
+    }
+    EndMode3D();
+    EndTextureMode();
+}
+
+static void UiDrawOrbitMapWindow(const SolarState &solar, ClimateSettings &climate, OrbitCamera &mainCam)
+{
+    if (!g_ui.showOrbitMap) return;
+
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    if (g_ui.orbitMapMaximized) {
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(ImVec2((float)sw, (float)sh));
+    } else {
+        ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 280)), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(380, 280), ImGuiCond_FirstUseEver);
+    }
+
+    ImGuiWindowFlags flags = ImGuiWindowFlags_NoScrollbar;
+    if (g_ui.orbitMapMaximized) flags |= ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove;
+
+    if (!ImGui::Begin("Orbit map", &g_ui.showOrbitMap, flags)) { ImGui::End(); return; }
+
+    const char *maxLabel = g_ui.orbitMapMaximized ? "Restore" : "Maximize";
+    if (ImGui::SmallButton(maxLabel)) g_ui.orbitMapMaximized = !g_ui.orbitMapMaximized;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Focus planet")) g_ui.focusRequestPlanet = true;
+    ImGui::SameLine();
+    ImGui::TextDisabled("drag rotate · scroll zoom");
+
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    int targetW = (int)avail.x;
+    int targetH = (int)avail.y;
+    UiEnsureOrbitTextureSize(targetW, targetH);
+    UiRenderOrbitMapTexture(solar, climate);
+
+    ImVec2 imgStart = ImGui::GetCursorScreenPos();
+    rlImGuiImageRenderTexture(&g_ui.orbitTex);
+    ImGui::SetCursorScreenPos(imgStart);
+    ImGui::InvisibleButton("##orbit_view", avail);
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f)) {
+        ImVec2 d = ImGui::GetIO().MouseDelta;
+        g_ui.orbitYaw   -= d.x * 0.012f;
+        g_ui.orbitPitch += d.y * 0.012f;
+        if (g_ui.orbitPitch >  1.45f) g_ui.orbitPitch =  1.45f;
+        if (g_ui.orbitPitch < -1.45f) g_ui.orbitPitch = -1.45f;
+    }
+    if (ImGui::IsItemHovered()) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            g_ui.orbitDistance *= powf(0.92f, wheel);
+            if (g_ui.orbitDistance < 0.8f) g_ui.orbitDistance = 0.8f;
+            if (g_ui.orbitDistance > 12.0f) g_ui.orbitDistance = 12.0f;
+        }
+    }
+
+    ImGui::End();
+
+    if (g_ui.focusRequestPlanet) {
+        mainCam.distanceTarget = 6.5f;
+        g_ui.focusRequestPlanet = false;
+    }
+}
+
+// ============================================================
+// End ImGui-based UI
+// ============================================================
+
 int main(void)
 {
     srand((unsigned int)time(NULL));
@@ -3905,6 +3525,9 @@ int main(void)
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(1280, 800, "Planet");
     SetTargetFPS(60);
+
+    rlImGuiSetup(true);
+    UiInit();
 
     Image sunGlowImage = GenImageGradientRadial(256, 256, 0.08f, WHITE, BLANK);
     Texture2D sunGlowTexture = LoadTextureFromImage(sunGlowImage);
@@ -3928,7 +3551,6 @@ int main(void)
     int atmosphereScatteringStrengthLoc = GetShaderLocation(atmosphereShader, "scatteringStrength");
 
     ClimateSettings climate = {
-        .panelOpen = true,
         .autoAdvanceTime = true,
         .dayNightEnabled = true,
         .seasonsEnabled = true,
@@ -3949,8 +3571,6 @@ int main(void)
         .temperatureContrast = 1.0f,
         .atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF,
         .atmosphereScatteringScale = 1.0f,
-        .panelScroll = 0.0f,
-        .panelContentHeight = 0.0f,
     };
     SolarState solar = BuildSolarState(&climate);
 
@@ -4010,10 +3630,7 @@ int main(void)
     bool showPlateView = false;
     bool tectonicsPaused = false;
     bool weatherEnabled = true;
-    bool showClimateCharts = false;
-    bool showClimateChartsCollapsed = false;
     WeatherViewMode weatherView = WEATHER_VIEW_TEMPERATURE;
-    WeatherViewMode climateChartView = WEATHER_VIEW_TEMPERATURE;
     int selectedTile = -1;
     Vector2 clickStart = { 0 };
     float tectonicRebuildTimer = 0.0f;
@@ -4023,36 +3640,38 @@ int main(void)
     bool resetWeatherRequested = false;
 
     while (!WindowShouldClose()) {
-        Rectangle controlPanelRect = ControlPanelBounds();
-        Rectangle sidebarToggleRect = SidebarToggleBounds(climate.panelOpen);
-        bool controlPanelHovered = climate.panelOpen && CheckCollisionPointRec(GetMousePosition(), controlPanelRect);
-        bool sidebarToggleHovered = CheckCollisionPointRec(GetMousePosition(), sidebarToggleRect);
-        bool climateChartsHovered = showClimateCharts && CheckCollisionPointRec(GetMousePosition(), ClimateChartsBounds(showClimateChartsCollapsed));
-        bool climateChartsCapturing = showClimateCharts && gPanelActiveWidgetId <= -220;
-        bool uiCapturing = gPanelActiveWidgetId != 0;
-        bool uiHovered = controlPanelHovered || sidebarToggleHovered || climateChartsHovered || climateChartsCapturing || uiCapturing;
+        ImGuiIO &io = ImGui::GetIO();
+        bool uiHovered = io.WantCaptureMouse || io.WantCaptureKeyboard;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiHovered) clickStart = GetMousePosition();
-        if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
-        if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
-        if (IsKeyPressed(KEY_SPACE)) tectonicsPaused = !tectonicsPaused;
-        if (IsKeyPressed(KEY_P)) climate.autoAdvanceTime = !climate.autoAdvanceTime;
-        if (IsKeyPressed(KEY_W)) weatherEnabled = !weatherEnabled;
-        if (IsKeyPressed(KEY_F1)) climate.panelOpen = !climate.panelOpen;
-        if (IsKeyPressed(KEY_T)) climate.showTiltAxis = !climate.showTiltAxis;
-        if (IsKeyPressed(KEY_TAB)) weatherView = (WeatherViewMode)((weatherView + 1) % WEATHER_VIEW_COUNT);
-        if (IsKeyPressed(KEY_ONE)) weatherView = WEATHER_VIEW_TEMPERATURE;
-        if (IsKeyPressed(KEY_TWO)) weatherView = WEATHER_VIEW_PRESSURE;
-        if (IsKeyPressed(KEY_THREE)) weatherView = WEATHER_VIEW_WIND;
-        if (IsKeyPressed(KEY_FOUR)) weatherView = WEATHER_VIEW_CURRENT;
-        if (IsKeyPressed(KEY_FIVE)) weatherView = WEATHER_VIEW_HUMIDITY;
-        if (IsKeyPressed(KEY_SIX)) weatherView = WEATHER_VIEW_CLOUD;
-        if (IsKeyPressed(KEY_SEVEN)) weatherView = WEATHER_VIEW_RAIN;
-        if (IsKeyPressed(KEY_EIGHT)) weatherView = WEATHER_VIEW_VORTICITY;
-        if (IsKeyPressed(KEY_NINE)) weatherView = WEATHER_VIEW_STORM;
-        if (IsKeyPressed(KEY_E)) weatherView = WEATHER_VIEW_EVAPORATION;
-        if (IsKeyPressed(KEY_ZERO)) weatherView = WEATHER_VIEW_SNOW;
-        if (IsKeyPressed(KEY_R)) weatherView = WEATHER_VIEW_OCEAN_TEMP;
-        if (IsKeyPressed(KEY_B)) weatherView = WEATHER_VIEW_BIOME;
+
+        if (!io.WantCaptureKeyboard) {
+            if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
+            if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
+            if (IsKeyPressed(KEY_SPACE)) tectonicsPaused = !tectonicsPaused;
+            if (IsKeyPressed(KEY_P)) climate.autoAdvanceTime = !climate.autoAdvanceTime;
+            if (IsKeyPressed(KEY_W)) weatherEnabled = !weatherEnabled;
+            if (IsKeyPressed(KEY_F1)) g_ui.uiVisible = !g_ui.uiVisible;
+            if (IsKeyPressed(KEY_F2)) g_ui.showControls = !g_ui.showControls;
+            if (IsKeyPressed(KEY_F3)) g_ui.showInspector = !g_ui.showInspector;
+            if (IsKeyPressed(KEY_F4)) g_ui.showCharts = !g_ui.showCharts;
+            if (IsKeyPressed(KEY_F5)) g_ui.showLegend = !g_ui.showLegend;
+            if (IsKeyPressed(KEY_F6)) g_ui.showOrbitMap = !g_ui.showOrbitMap;
+            if (IsKeyPressed(KEY_T)) climate.showTiltAxis = !climate.showTiltAxis;
+            if (IsKeyPressed(KEY_TAB)) weatherView = (WeatherViewMode)(((int)weatherView + 1) % WEATHER_VIEW_COUNT);
+            if (IsKeyPressed(KEY_ONE)) weatherView = WEATHER_VIEW_TEMPERATURE;
+            if (IsKeyPressed(KEY_TWO)) weatherView = WEATHER_VIEW_PRESSURE;
+            if (IsKeyPressed(KEY_THREE)) weatherView = WEATHER_VIEW_WIND;
+            if (IsKeyPressed(KEY_FOUR)) weatherView = WEATHER_VIEW_CURRENT;
+            if (IsKeyPressed(KEY_FIVE)) weatherView = WEATHER_VIEW_HUMIDITY;
+            if (IsKeyPressed(KEY_SIX)) weatherView = WEATHER_VIEW_CLOUD;
+            if (IsKeyPressed(KEY_SEVEN)) weatherView = WEATHER_VIEW_RAIN;
+            if (IsKeyPressed(KEY_EIGHT)) weatherView = WEATHER_VIEW_VORTICITY;
+            if (IsKeyPressed(KEY_NINE)) weatherView = WEATHER_VIEW_STORM;
+            if (IsKeyPressed(KEY_E)) weatherView = WEATHER_VIEW_EVAPORATION;
+            if (IsKeyPressed(KEY_ZERO)) weatherView = WEATHER_VIEW_SNOW;
+            if (IsKeyPressed(KEY_R)) weatherView = WEATHER_VIEW_OCEAN_TEMP;
+            if (IsKeyPressed(KEY_B)) weatherView = WEATHER_VIEW_BIOME;
+        }
         float dt = GetFrameTime();
 
         if (climate.autoAdvanceTime) {
@@ -4098,6 +3717,8 @@ int main(void)
                 weatherA = weatherB;
                 weatherB = swap;
                 UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
+                if (selectedTile >= 0 && selectedTile < tileCount)
+                    UiPushInspectorSample(&weatherA[selectedTile], selectedTile);
                 weatherTimer -= weatherStep;
             }
         }
@@ -4163,14 +3784,20 @@ int main(void)
             DrawTexturePro(sceneTexture.texture, source, destination, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
         }
 
-        DrawSelectedTileInfo(tiles, plates, weatherA, tileCount, selectedTile, tectonicsPaused, weatherEnabled, weatherView);
-        DrawWeatherColorLegend(weatherView, weatherEnabled, showPlateView, climate.panelOpen);
-        if (climate.panelOpen) {
-            DrawControlPanel(&climate, &showPlateView, &atmosphereEnabled, &weatherEnabled, &tectonicsPaused, &weatherView, &resetWeatherRequested, &showClimateCharts, &solar);
-        } else {
-            DrawCollapsedSidebarToggle(&climate.panelOpen);
+        rlImGuiBegin();
+        if (g_ui.uiVisible) {
+            ImGui::GetStyle().Alpha = g_ui.uiAlpha;
+            UiDrawTopBar(climate, (int)WEATHER_UPDATE_HZ);
+            UiDrawControlsWindow(climate, atmosphereEnabled, weatherEnabled, tectonicsPaused,
+                                 showPlateView, weatherView, resetWeatherRequested, solar);
+            UiDrawInspectorWindow(tiles, plates, weatherA, tileCount, selectedTile, weatherView);
+            UiDrawChartsWindow(climateCharts, climate.yearPhase);
+            UiDrawLegendWindow(weatherView, weatherEnabled, showPlateView);
+            UiDrawOrbitMapWindow(solar, climate, orbit);
+            if (g_ui.showImGuiDemo) ImGui::ShowDemoWindow(&g_ui.showImGuiDemo);
+            if (g_ui.showImPlotDemo) ImPlot::ShowDemoWindow(&g_ui.showImPlotDemo);
         }
-        DrawClimateChartsPopup(&showClimateCharts, &showClimateChartsCollapsed, &climateCharts, &climateChartView, climate.yearPhase);
+        rlImGuiEnd();
 
         EndDrawing();
     }
@@ -4187,6 +3814,8 @@ int main(void)
     UnloadRenderTexture(sceneTexture);
     UnloadShader(atmosphereShader);
 
+    UiShutdown();
+    rlImGuiShutdown();
     CloseWindow();
     return 0;
 }
