@@ -2602,36 +2602,42 @@ static void DrawTiltAxisGuide(const Tile *tiles, int tileCount, const SolarState
     DrawCylinderEx(Vector3Scale(planetUp, -innerRadius), Vector3Scale(planetUp, -outerRadius * 0.92f), 0.010f, 0.010f, 10, (Color){ 248, 250, 255, 185 });
 }
 
-static void DrawSpaceBackground(int screenWidth, int screenHeight, float clock)
+static void DrawSpaceBackground(int screenWidth, int screenHeight, Camera3D camera, float clock)
 {
     DrawRectangleGradientV(0, 0, screenWidth, screenHeight, (Color){ 5, 8, 18, 255 }, (Color){ 1, 2, 7, 255 });
 
-    int cellSize = 32;
-    int cols = screenWidth / cellSize + 2;
-    int rows = screenHeight / cellSize + 2;
-    for (int y = 0; y < rows; y++) {
-        for (int x = 0; x < cols; x++) {
-            float starChance = Hash2D01(x, y, 17);
-            if (starChance < 0.915f) continue;
+    Vector3 cameraForward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
+    const int starCount = 720;
+    const float starDistance = 240.0f;
+    for (int i = 0; i < starCount; i++) {
+        float u = Hash2D01(i, 0, 17);
+        float v = Hash2D01(i, 0, 29);
+        float z = 1.0f - 2.0f * u;
+        float angle = 2.0f * PI * v;
+        float r = sqrtf(fmaxf(0.0f, 1.0f - z * z));
+        Vector3 dir = { r * cosf(angle), z, r * sinf(angle) };
+        if (Vector3DotProduct(cameraForward, dir) <= 0.02f) continue;
 
-            float px = ((float)x + Hash2D01(x, y, 29)) * (float)cellSize;
-            float py = ((float)y + Hash2D01(x, y, 43)) * (float)cellSize;
-            float phase = Hash2D01(x, y, 61) * 2.0f * PI;
-            float twinkle = 0.78f + 0.22f * sinf(clock * (0.7f + Hash2D01(x, y, 73) * 1.3f) + phase);
-            float hueMix = Hash2D01(x, y, 97);
-            Color cool = (Color){ 156, 194, 255, 255 };
-            Color warm = (Color){ 255, 232, 198, 255 };
-            Color star = LerpColor(cool, warm, hueMix * 0.42f);
-            star.a = (unsigned char)(ClampFloat(190.0f + starChance * 75.0f * twinkle, 0.0f, 255.0f));
+        Vector3 starWorld = Vector3Scale(dir, starDistance);
+        Vector2 screen = GetWorldToScreen(starWorld, camera);
+        if (screen.x < -8.0f || screen.x > (float)screenWidth + 8.0f || screen.y < -8.0f || screen.y > (float)screenHeight + 8.0f) continue;
 
-            int size = starChance > 0.992f ? 3 : (starChance > 0.970f ? 2 : 1);
-            DrawRectangle((int)px, (int)py, size, size, star);
-            if (size > 1) {
-                Color glow = star;
-                glow.a = (unsigned char)(star.a * 0.45f);
-                DrawRectangle((int)px - 2, (int)py, size + 4, 1, glow);
-                DrawRectangle((int)px, (int)py - 2, 1, size + 4, glow);
-            }
+        float brightness = Hash2D01(i, 0, 43);
+        float phase = Hash2D01(i, 0, 61) * 2.0f * PI;
+        float twinkle = 0.82f + 0.18f * sinf(clock * (0.45f + Hash2D01(i, 0, 73) * 1.1f) + phase);
+        float hueMix = Hash2D01(i, 0, 97);
+        Color cool = (Color){ 156, 194, 255, 255 };
+        Color warm = (Color){ 255, 232, 198, 255 };
+        Color star = LerpColor(cool, warm, hueMix * 0.42f);
+        star.a = (unsigned char)ClampFloat((120.0f + brightness * 135.0f) * twinkle, 0.0f, 255.0f);
+
+        int size = brightness > 0.985f ? 3 : (brightness > 0.940f ? 2 : 1);
+        DrawRectangle((int)screen.x, (int)screen.y, size, size, star);
+        if (size > 1) {
+            Color glow = star;
+            glow.a = (unsigned char)(star.a * 0.40f);
+            DrawRectangle((int)screen.x - 2, (int)screen.y, size + 4, 1, glow);
+            DrawRectangle((int)screen.x, (int)screen.y - 2, 1, size + 4, glow);
         }
     }
 }
@@ -3240,34 +3246,40 @@ static bool DrawControlPanel(
     PanelCheckbox(&layout, "Plate View", showPlateView);
     PanelCheckbox(&layout, "Pause Tectonics", tectonicsPaused);
 
-    PanelDrawSectionTitle(&layout, "Time And Sun");
+    PanelDrawSectionTitle(&layout, "Time");
     PanelCheckbox(&layout, "Auto Advance Time", &climate->autoAdvanceTime);
     PanelCheckbox(&layout, "Day/Night Heating", &climate->dayNightEnabled);
     PanelCheckbox(&layout, "Seasonal Shift", &climate->seasonsEnabled);
-    PanelCheckbox(&layout, "Show Sun Orbit", &climate->showSunOrbit);
-    PanelCheckbox(&layout, "Show Tilt Axis", &climate->showTiltAxis);
     PanelSliderFloat(&layout, "Day Phase", &climate->dayPhase, 0.0f, 1.0f, "%.2f");
     climate->dayPhase = Wrap01(climate->dayPhase);
     PanelSliderFloat(&layout, "Year Phase", &climate->yearPhase, 0.0f, 1.0f, "%.2f");
     climate->yearPhase = Wrap01(climate->yearPhase);
     PanelSliderFloat(&layout, "Day Speed", &climate->daySpeed, 0.0f, 4.0f, "%.2fx");
     PanelSliderFloat(&layout, "Year Speed", &climate->yearSpeed, 0.0f, 4.0f, "%.2fx");
-    PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 45.0f, "%.1f deg");
-    PanelSliderFloat(&layout, "Orbit Distance", &climate->orbitDistanceAu, 0.20f, 5.00f, "%.2f AU");
-    PanelSliderFloat(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, 0.0f, 0.65f, "%.2f");
-    PanelSliderFloat(&layout, "Star Luminosity", &climate->stellarLuminosity, 0.05f, 5.00f, "%.2f L");
-    PanelSliderFloat(&layout, "Star Color Temp", &climate->stellarTemperatureK, 2500.0f, 10000.0f, "%.0f K");
+
+    PanelDrawSectionTitle(&layout, "Orbit");
+    PanelSliderFloat(&layout, "Orbit Distance", &climate->orbitDistanceAu, 0.05f, 20.00f, "%.2f AU");
+    PanelSliderFloat(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, 0.0f, 0.85f, "%.2f");
+    PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 89.0f, "%.1f deg");
+
+    PanelDrawSectionTitle(&layout, "Star");
+    PanelSliderFloat(&layout, "Star Luminosity", &climate->stellarLuminosity, 0.01f, 50.00f, "%.2f L");
+    PanelSliderFloat(&layout, "Star Color Temp", &climate->stellarTemperatureK, 1800.0f, 12000.0f, "%.0f K");
     PanelSliderFloat(&layout, "Sun Brightness", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
+
+    PanelDrawSectionTitle(&layout, "Climate");
     PanelSliderFloat(&layout, "Greenhouse", &climate->greenhouseC, -30.0f, 65.0f, "%.0f C");
+    PanelSliderFloat(&layout, "Temp Contrast", &climate->temperatureContrast, 0.50f, 1.80f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Weather And Atmosphere");
     PanelSliderFloat(&layout, "Weather Speed", &climate->weatherTimeScale, 0.25f, 6.0f, "%.2fx");
-    PanelSliderFloat(&layout, "Temp Contrast", &climate->temperatureContrast, 0.50f, 1.80f, "%.2fx");
     PanelSliderFloat(&layout, "Atmo Density", &climate->atmosphereDensityFalloff, 1.20f, 4.60f, "%.2f");
     PanelSliderFloat(&layout, "Atmo Scatter", &climate->atmosphereScatteringScale, 0.25f, 2.40f, "%.2fx");
     if (PanelButton(&layout, "Reset Weather To Current Climate")) *resetWeatherRequested = true;
 
     PanelDrawSectionTitle(&layout, "Views");
+    PanelCheckbox(&layout, "Show Sun Orbit", &climate->showSunOrbit);
+    PanelCheckbox(&layout, "Show Tilt Axis", &climate->showTiltAxis);
     PanelDrawWeatherViewSelector(&layout, weatherView);
     if (PanelButton(&layout, *showClimateCharts ? "Hide Climate Charts" : "Pop Out Climate Charts")) {
         *showClimateCharts = !*showClimateCharts;
@@ -3883,7 +3895,7 @@ int main(void)
         .dayNightEnabled = true,
         .seasonsEnabled = true,
         .showSunOrbit = false,
-        .showTiltAxis = true,
+        .showTiltAxis = false,
         .dayPhase = 0.18f,
         .yearPhase = 0.08f,
         .daySpeed = 1.0f,
@@ -4101,7 +4113,7 @@ int main(void)
         Rectangle destination = { 0.0f, 0.0f, (float)screenWidth, (float)screenHeight };
 
         BeginDrawing();
-        DrawSpaceBackground(screenWidth, screenHeight, (float)GetTime());
+        DrawSpaceBackground(screenWidth, screenHeight, camera, (float)GetTime());
         if (climate.showSunOrbit) DrawSunOrbitGuide(camera, &solar);
         DrawSunIndicator(camera, &solar);
         if (atmosphereEnabled) {
