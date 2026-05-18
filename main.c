@@ -12,7 +12,7 @@
 
 #define PLANET_RADIUS 1.8f
 #define SEA_LEVEL 0.0f
-#define SUBDIVISIONS 5
+#define SUBDIVISIONS 6
 #define MAX_TILE_CORNERS 8
 #define POLY_BLEND_TANGENT 0.004f
 #define POLY_BLEND_RADIAL 0.000f
@@ -195,6 +195,7 @@ typedef struct SolarState {
     float equilibriumTemperatureC;
     float habitableZoneInnerAu;
     float habitableZoneOuterAu;
+    float stellarTemperatureK;
     Color starColor;
 } SolarState;
 
@@ -365,6 +366,7 @@ static SolarState BuildSolarState(const ClimateSettings *climate)
     solar.equilibriumTemperatureC = 255.0f * powf(fmaxf(solar.stellarFlux, 0.0001f), 0.25f) - 273.15f + climate->greenhouseC;
     solar.habitableZoneInnerAu = sqrtf(luminosity / 1.10f);
     solar.habitableZoneOuterAu = sqrtf(luminosity / 0.53f);
+    solar.stellarTemperatureK = climate->stellarTemperatureK;
     solar.starColor = StarColorFromTemperature(climate->stellarTemperatureK);
 
     Vector3 equatorialSun = Vector3Add(
@@ -2525,7 +2527,19 @@ static Vector3 AtmosphereScatterCoefficients(float strength)
     };
 }
 
-static void DrawSunIndicator(Camera3D camera, const SolarState *solar)
+static void DrawBillboardDisc(Vector3 center, Vector3 right, Vector3 up, float radius, Color color, int segments)
+{
+    if (radius <= 0.0f || color.a == 0 || segments < 8) return;
+    for (int i = 0; i < segments; i++) {
+        float a0 = ((float)i / (float)segments) * 2.0f * PI;
+        float a1 = ((float)(i + 1) / (float)segments) * 2.0f * PI;
+        Vector3 p0 = Vector3Add(center, Vector3Add(Vector3Scale(right, cosf(a0) * radius), Vector3Scale(up, sinf(a0) * radius)));
+        Vector3 p1 = Vector3Add(center, Vector3Add(Vector3Scale(right, cosf(a1) * radius), Vector3Scale(up, sinf(a1) * radius)));
+        DrawTriangle3D(center, p1, p0, color);
+    }
+}
+
+static void DrawSunBillboard(Camera3D camera, const SolarState *solar)
 {
     Vector3 lightDir = SunLightDirection(solar);
     Vector3 sunWorld = Vector3Scale(lightDir, 120.0f);
@@ -2533,13 +2547,41 @@ static void DrawSunIndicator(Camera3D camera, const SolarState *solar)
     Vector3 cameraForward = Vector3Normalize(Vector3Subtract(camera.target, camera.position));
     if (Vector3DotProduct(cameraForward, toSun) <= 0.0f) return;
 
-    Vector2 sunScreen = GetWorldToScreen(sunWorld, camera);
-    float radius = 18.0f;
+    Vector3 right = Vector3Normalize(Vector3CrossProduct(cameraForward, camera.up));
+    if (Vector3LengthSqr(right) < 0.000001f) right = (Vector3){ 1.0f, 0.0f, 0.0f };
+    Vector3 up = Vector3Normalize(Vector3CrossProduct(right, cameraForward));
+
+    float luminosity = fmaxf(0.01f, solar->stellarFlux * solar->orbitDistanceAu * solar->orbitDistanceAu);
+    float temperatureRatio = fmaxf(0.20f, solar->stellarTemperatureK / 5778.0f);
+    float starRadiusSolar = sqrtf(luminosity) / fmaxf(0.20f, temperatureRatio * temperatureRatio);
+    float apparentScale = ClampFloat(starRadiusSolar / fmaxf(0.08f, solar->orbitDistanceAu), 0.26f, 4.2f);
+    float coreRadius = 0.42f + apparentScale * 0.48f;
+    float haloRadius = coreRadius * (4.6f + apparentScale * 0.45f);
     Color star = solar->starColor;
-    DrawCircleV(sunScreen, radius * 4.6f, (Color){ star.r, star.g, star.b, 18 });
-    DrawCircleV(sunScreen, radius * 3.1f, (Color){ star.r, star.g, star.b, 34 });
-    DrawCircleV(sunScreen, radius * 2.0f, (Color){ star.r, star.g, star.b, 72 });
-    DrawCircleV(sunScreen, radius * 1.1f, (Color){ 255, 248, 226, 246 });
+    Color warmCorona = LerpColor(star, (Color){ 255, 194, 112, 255 }, 0.28f);
+    Color hotCore = LerpColor(star, (Color){ 255, 252, 232, 255 }, 0.72f);
+
+    rlDisableBackfaceCulling();
+    DrawBillboardDisc(sunWorld, right, up, haloRadius, (Color){ warmCorona.r, warmCorona.g, warmCorona.b, 18 }, 64);
+    DrawBillboardDisc(sunWorld, right, up, coreRadius * 3.0f, (Color){ star.r, star.g, star.b, 28 }, 64);
+
+    for (int i = 0; i < 18; i++) {
+        float angle = ((float)i / 18.0f) * 2.0f * PI;
+        float length = coreRadius * LerpFloat(2.8f, 5.8f, Hash2D01(i, 0, 131));
+        float width = coreRadius * LerpFloat(0.045f, 0.095f, Hash2D01(i, 0, 149));
+        Vector3 rayDir = Vector3Add(Vector3Scale(right, cosf(angle)), Vector3Scale(up, sinf(angle)));
+        Vector3 raySide = Vector3Add(Vector3Scale(right, -sinf(angle)), Vector3Scale(up, cosf(angle)));
+        Vector3 base = Vector3Add(sunWorld, Vector3Scale(rayDir, coreRadius * 1.22f));
+        Vector3 tip = Vector3Add(sunWorld, Vector3Scale(rayDir, length));
+        Vector3 p0 = Vector3Add(base, Vector3Scale(raySide, width));
+        Vector3 p1 = Vector3Subtract(base, Vector3Scale(raySide, width));
+        DrawTriangle3D(tip, p0, p1, (Color){ warmCorona.r, warmCorona.g, warmCorona.b, (unsigned char)LerpFloat(18.0f, 42.0f, Hash2D01(i, 0, 167)) });
+    }
+
+    DrawBillboardDisc(sunWorld, right, up, coreRadius * 1.36f, (Color){ star.r, star.g, star.b, 116 }, 64);
+    DrawBillboardDisc(sunWorld, right, up, coreRadius * 0.82f, (Color){ hotCore.r, hotCore.g, hotCore.b, 238 }, 64);
+    DrawBillboardDisc(Vector3Add(sunWorld, Vector3Add(Vector3Scale(right, -coreRadius * 0.18f), Vector3Scale(up, coreRadius * 0.18f))), right, up, coreRadius * 0.30f, (Color){ 255, 255, 250, 168 }, 32);
+    rlEnableBackfaceCulling();
 }
 
 static void DrawSunOrbitGuide(Camera3D camera, const SolarState *solar)
@@ -4084,6 +4126,7 @@ int main(void)
         BeginTextureMode(sceneTexture);
         ClearBackground((Color){ 0, 0, 0, 0 });
         BeginMode3D(camera);
+        DrawSunBillboard(camera, &solar);
         DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile, &solar);
         if (climate.showTiltAxis) DrawTiltAxisGuide(tiles, tileCount, &solar);
         if (!showPlateView && weatherEnabled) DrawWeatherClouds(tiles, weatherA, tileCount, weatherView);
@@ -4115,7 +4158,6 @@ int main(void)
         BeginDrawing();
         DrawSpaceBackground(screenWidth, screenHeight, camera, (float)GetTime());
         if (climate.showSunOrbit) DrawSunOrbitGuide(camera, &solar);
-        DrawSunIndicator(camera, &solar);
         if (atmosphereEnabled) {
             BeginShaderMode(atmosphereShader);
             DrawTexturePro(sceneTexture.texture, source, destination, (Vector2){ 0.0f, 0.0f }, 0.0f, WHITE);
