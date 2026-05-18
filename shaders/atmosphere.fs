@@ -29,6 +29,14 @@ float rayleighPhase(float cosTheta)
     return 0.75 * (1.0 + cosTheta * cosTheta);
 }
 
+float miePhase(float cosTheta)
+{
+    float g = 0.72;
+    float g2 = g * g;
+    float denom = pow(max(1.0 + g2 - 2.0 * g * cosTheta, 0.001), 1.5);
+    return (1.0 - g2) / denom;
+}
+
 vec2 raySphere(vec3 rayOrigin, vec3 rayDir, float sphereRadius)
 {
     float b = dot(rayOrigin, rayDir);
@@ -76,7 +84,8 @@ vec3 calculateAtmosphere(vec3 rayOrigin, vec3 rayDir, float rayLength, out float
     totalViewDepth = 0.0;
     vec3 samplePoint = rayOrigin + rayDir * (stepSize * 0.5);
     float cosTheta = dot(lightDir, -rayDir);
-    float phase = rayleighPhase(cosTheta);
+    float rayleigh = rayleighPhase(cosTheta);
+    float mie = miePhase(cosTheta);
 
     for (int i = 0; i < INSCATTER_POINTS; i++) {
         float localDensity = densityAtPoint(samplePoint);
@@ -95,7 +104,9 @@ vec3 calculateAtmosphere(vec3 rayOrigin, vec3 rayDir, float rayLength, out float
         vec3 transmittance = exp(-(sunDepth + totalViewDepth) * scatteringCoefficients);
         float horizonGlow = pow(1.0 - abs(dot(normalize(samplePoint), lightDir)), 2.2);
         vec3 horizonTint = mix(vec3(1.0), vec3(1.18, 0.94, 0.78), horizonGlow * 0.55);
-        inScattered += localDensity * transmittance * scatteringCoefficients * stepSize * phase * horizonTint * starColor;
+        vec3 rayleighLight = scatteringCoefficients * rayleigh;
+        vec3 mieLight = vec3(0.055) * mie;
+        inScattered += localDensity * transmittance * (rayleighLight + mieLight) * stepSize * horizonTint * starColor;
         samplePoint += rayDir * stepSize;
     }
 
@@ -136,7 +147,11 @@ void main()
     float totalViewDepth = 0.0;
     vec3 atmosphereLight = calculateAtmosphere(atmosphereStart, rayDir, distanceThroughAtmosphere, totalViewDepth);
     vec3 viewTransmittance = exp(-totalViewDepth * scatteringCoefficients * 0.35);
+    float lightStrength = max(max(atmosphereLight.r, atmosphereLight.g), atmosphereLight.b);
+    float shellAlpha = clamp(1.0 - exp(-totalViewDepth * 0.55), 0.0, 0.42);
+    float skyAlpha = clamp(lightStrength * 1.35 + shellAlpha * 0.42, 0.0, 0.78);
+    float surfaceAlpha = clamp(sceneColor.a, 0.0, 1.0);
     vec3 color = sceneColor.rgb * viewTransmittance + atmosphereLight;
-    float atmosphereAlpha = clamp(max(max(atmosphereLight.r, atmosphereLight.g), atmosphereLight.b), 0.0, 1.0);
-    finalColor = vec4(color, max(sceneColor.a, atmosphereAlpha));
+    float alpha = mix(skyAlpha, surfaceAlpha, surfaceAlpha);
+    finalColor = vec4(color, alpha);
 }

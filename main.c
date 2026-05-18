@@ -3985,7 +3985,9 @@ int main(void)
     ClimateChartHistory climateCharts = { 0 };
     ResetClimateChartHistory(&climateCharts);
     UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
-    atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
+    atmospherePlanetRadius = MaxSurfaceRadius(tiles, tileCount);
+    atmosphereOuterRadius = atmospherePlanetRadius + ATMOSPHERE_SURFACE_MARGIN;
+    SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
     SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
 
     OrbitCamera orbit = {
@@ -4075,7 +4077,9 @@ int main(void)
             if (tectonicRebuildTimer >= tectonicRebuildStep) {
                 tectonicRebuildTimer -= tectonicRebuildStep;
                 UpdatePlanetTiles(tiles, tileCount, triangleDirections, triangleSurfacePoints, triangles.count, plates, plateCount, PLANET_RADIUS);
-                atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
+                atmospherePlanetRadius = MaxSurfaceRadius(tiles, tileCount);
+                atmosphereOuterRadius = atmospherePlanetRadius + ATMOSPHERE_SURFACE_MARGIN;
+                SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
                 SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
             }
         }
