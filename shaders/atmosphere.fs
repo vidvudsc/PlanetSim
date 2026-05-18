@@ -16,6 +16,7 @@ uniform float aspectRatio;
 uniform float planetRadius;
 uniform float atmosphereRadius;
 uniform vec3 lightDir;
+uniform vec3 starColor;
 uniform vec3 scatteringCoefficients;
 uniform float densityFalloff;
 uniform float scatteringStrength;
@@ -94,7 +95,7 @@ vec3 calculateAtmosphere(vec3 rayOrigin, vec3 rayDir, float rayLength, out float
         vec3 transmittance = exp(-(sunDepth + totalViewDepth) * scatteringCoefficients);
         float horizonGlow = pow(1.0 - abs(dot(normalize(samplePoint), lightDir)), 2.2);
         vec3 horizonTint = mix(vec3(1.0), vec3(1.18, 0.94, 0.78), horizonGlow * 0.55);
-        inScattered += localDensity * transmittance * scatteringCoefficients * stepSize * phase * horizonTint;
+        inScattered += localDensity * transmittance * scatteringCoefficients * stepSize * phase * horizonTint * starColor;
         samplePoint += rayDir * stepSize;
     }
 

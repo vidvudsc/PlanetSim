@@ -31,8 +31,8 @@
 #define ATMOSPHERE_SCATTERING_STRENGTH 24.0f
 #define MAX_TILE_NEIGHBORS 8
 #define FLOW_ARROW_SEGMENTS 5
-#define WEATHER_MIN_TEMP_C -45.0f
-#define WEATHER_MAX_TEMP_C 45.0f
+#define WEATHER_MIN_TEMP_C -120.0f
+#define WEATHER_MAX_TEMP_C 95.0f
 #define WEATHER_PRESSURE_MIN_HPA 540.0f
 #define WEATHER_PRESSURE_MAX_HPA 1065.0f
 #define WEATHER_SEA_LEVEL_PRESSURE_HPA 1013.25f
@@ -171,6 +171,11 @@ typedef struct ClimateSettings {
     float yearSpeed;
     float axialTiltDegrees;
     float solarIntensity;
+    float orbitDistanceAu;
+    float orbitEccentricity;
+    float stellarLuminosity;
+    float stellarTemperatureK;
+    float greenhouseC;
     float weatherTimeScale;
     float temperatureContrast;
     float atmosphereDensityFalloff;
@@ -185,6 +190,12 @@ typedef struct SolarState {
     Vector3 orbitForward;
     Vector3 lightDir;
     float declination;
+    float orbitDistanceAu;
+    float stellarFlux;
+    float equilibriumTemperatureC;
+    float habitableZoneInnerAu;
+    float habitableZoneOuterAu;
+    Color starColor;
 } SolarState;
 
 typedef struct WeatherForcing {
@@ -305,6 +316,31 @@ static Vector3 BuildClimateNorthPole(float axialTiltDegrees)
     return Vector3Normalize((Vector3){ sinf(tilt), cosf(tilt), 0.0f });
 }
 
+static Color StarColorFromTemperature(float kelvin)
+{
+    kelvin = ClampFloat(kelvin, 1800.0f, 12000.0f) / 100.0f;
+    float red = 255.0f;
+    float green = 255.0f;
+    float blue = 255.0f;
+
+    if (kelvin <= 66.0f) {
+        red = 255.0f;
+        green = 99.4708025861f * logf(kelvin) - 161.1195681661f;
+        blue = (kelvin <= 19.0f) ? 0.0f : 138.5177312231f * logf(kelvin - 10.0f) - 305.0447927307f;
+    } else {
+        red = 329.698727446f * powf(kelvin - 60.0f, -0.1332047592f);
+        green = 288.1221695283f * powf(kelvin - 60.0f, -0.0755148492f);
+        blue = 255.0f;
+    }
+
+    return (Color){
+        (unsigned char)ClampFloat(red, 0.0f, 255.0f),
+        (unsigned char)ClampFloat(green, 0.0f, 255.0f),
+        (unsigned char)ClampFloat(blue, 0.0f, 255.0f),
+        255
+    };
+}
+
 static SolarState BuildSolarState(const ClimateSettings *climate)
 {
     SolarState solar = { 0 };
@@ -320,6 +356,16 @@ static SolarState BuildSolarState(const ClimateSettings *climate)
     float dayAngle = climate->dayPhase * 2.0f * PI;
     float yearAngle = climate->yearPhase * 2.0f * PI;
     solar.declination = climate->seasonsEnabled ? sinf(yearAngle) * climate->axialTiltDegrees * DEG2RAD : 0.0f;
+    float eccentricity = ClampFloat(climate->orbitEccentricity, 0.0f, 0.85f);
+    float semiMajorAxis = fmaxf(0.05f, climate->orbitDistanceAu);
+    solar.orbitDistanceAu = semiMajorAxis * (1.0f - eccentricity * eccentricity) / fmaxf(0.08f, 1.0f + eccentricity * cosf(yearAngle));
+    solar.orbitDistanceAu = fmaxf(0.03f, solar.orbitDistanceAu);
+    float luminosity = fmaxf(0.01f, climate->stellarLuminosity * climate->solarIntensity);
+    solar.stellarFlux = luminosity / (solar.orbitDistanceAu * solar.orbitDistanceAu);
+    solar.equilibriumTemperatureC = 255.0f * powf(fmaxf(solar.stellarFlux, 0.0001f), 0.25f) - 273.15f + climate->greenhouseC;
+    solar.habitableZoneInnerAu = sqrtf(luminosity / 1.10f);
+    solar.habitableZoneOuterAu = sqrtf(luminosity / 0.53f);
+    solar.starColor = StarColorFromTemperature(climate->stellarTemperatureK);
 
     Vector3 equatorialSun = Vector3Add(
         Vector3Scale(solar.orbitRight, cosf(dayAngle)),
@@ -354,7 +400,28 @@ static float ClimateInsolation(Vector3 normal, const SolarState *solar, const Cl
     float daylightBoost = climate->dayNightEnabled ? fmaxf(0.0f, sunDot) * 0.26f : 0.12f;
     float nightsideCooling = climate->dayNightEnabled ? fmaxf(0.0f, -sunDot) * 0.08f : 0.0f;
     float insolation = ClampFloat(baseHeat + seasonBias + daylightBoost - nightsideCooling, 0.0f, 1.0f);
-    return ClampFloat(insolation * climate->solarIntensity, 0.0f, 1.0f);
+    float orbitalHeatScale = powf(fmaxf(solar->stellarFlux, 0.0001f), 0.25f);
+    return ClampFloat(insolation * orbitalHeatScale, 0.0f, 1.0f);
+}
+
+static float ClimateMeanSeaLevelTemperatureC(const SolarState *solar)
+{
+    return solar->equilibriumTemperatureC + 32.0f;
+}
+
+static float ClimateLiquidWaterFactor(const SolarState *solar)
+{
+    float meanC = ClimateMeanSeaLevelTemperatureC(solar);
+    float thaw = SmoothStep01((meanC + 18.0f) / 30.0f);
+    float boilLoss = SmoothStep01((meanC - 62.0f) / 36.0f);
+    return ClampFloat(thaw * (1.0f - boilLoss), 0.0f, 1.0f);
+}
+
+static const char *ClimateOrbitStatus(const SolarState *solar)
+{
+    if (solar->orbitDistanceAu < solar->habitableZoneInnerAu) return "Interior/hot";
+    if (solar->orbitDistanceAu > solar->habitableZoneOuterAu) return "Exterior/frozen";
+    return "Habitable zone";
 }
 
 static float DisplayElevation(float elevation)
@@ -383,12 +450,22 @@ static Color ScaleColorBrightness(Color color, float amount)
     };
 }
 
-static Color ShadeSurfaceColor(Color color, Vector3 normal, float strength)
+static Color ShadeSurfaceColor(Color color, Vector3 normal, float strength, const SolarState *solar)
 {
-    Vector3 lightDir = Vector3Normalize((Vector3){ -0.38f, 0.70f, 0.60f });
+    Vector3 lightDir = solar ? solar->lightDir : Vector3Normalize((Vector3){ -0.38f, 0.70f, 0.60f });
     float light = ClampFloat(Vector3DotProduct(normal, lightDir) * 0.5f + 0.5f, 0.0f, 1.0f);
     float amount = LerpFloat(1.0f - strength * 0.32f, 1.0f + strength * 0.24f, light);
-    return ScaleColorBrightness(color, amount);
+    Color shaded = ScaleColorBrightness(color, amount);
+    if (!solar) return shaded;
+    float rTint = LerpFloat(0.82f, 1.18f, (float)solar->starColor.r / 255.0f);
+    float gTint = LerpFloat(0.82f, 1.18f, (float)solar->starColor.g / 255.0f);
+    float bTint = LerpFloat(0.82f, 1.18f, (float)solar->starColor.b / 255.0f);
+    return (Color){
+        (unsigned char)ClampFloat((float)shaded.r * rTint, 0.0f, 255.0f),
+        (unsigned char)ClampFloat((float)shaded.g * gTint, 0.0f, 255.0f),
+        (unsigned char)ClampFloat((float)shaded.b * bTint, 0.0f, 255.0f),
+        shaded.a
+    };
 }
 
 static float WeatherTemperatureC(float temperature)
@@ -1028,7 +1105,8 @@ static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count, 
         float initializationStormTrack = GaussianBand(forcing.climateLat, 0.55f, 0.22f) * LerpFloat(0.70f, 1.16f, forcing.planetaryWave);
 
         WeatherTerrain terrain = BuildWeatherTerrain(&cells[i], 0.0f, 0.0f, cells[i].elevation);
-        float seaLevelTemperatureC = LerpFloat(-28.0f, 32.0f, powf(forcing.equatorHeat, 0.82f));
+        float meanTemperatureC = ClimateMeanSeaLevelTemperatureC(solar);
+        float seaLevelTemperatureC = meanTemperatureC + (powf(forcing.equatorHeat, 0.82f) - 0.55f) * (74.0f * climate->temperatureContrast);
         seaLevelTemperatureC += terrain.land * (forcing.equatorHeat - 0.48f) * 8.0f;
         seaLevelTemperatureC += terrain.ocean * 1.8f - terrain.oceanDepthKm * 0.25f;
         float temperatureC = seaLevelTemperatureC - terrain.altitudeKm * WEATHER_TROPO_LAPSE_C_PER_KM - terrain.highland * 2.5f;
@@ -1039,7 +1117,8 @@ static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count, 
         float pressureHpa = seaLevelPressureHpa * TerrainPressureFactor(terrain.altitudeKm);
         cells[i].pressure = WeatherPressure01FromHpa(pressureHpa);
         float saturation = WeatherSaturation(cells[i].temperature);
-        float relativeHumidity = ClampFloat(0.38f + terrain.ocean * 0.48f + initializationItcz * 0.16f + initializationStormTrack * 0.12f + terrain.coast * 0.10f + (forcing.moistureWave - 0.5f) * 0.14f - initializationHigh * 0.16f - terrain.altitudeKm * 0.035f, 0.10f, 1.05f);
+        float liquidWaterFactor = ClimateLiquidWaterFactor(solar);
+        float relativeHumidity = ClampFloat(0.20f + terrain.ocean * 0.48f * liquidWaterFactor + initializationItcz * 0.16f * liquidWaterFactor + initializationStormTrack * 0.12f + terrain.coast * 0.10f * liquidWaterFactor + (forcing.moistureWave - 0.5f) * 0.14f - initializationHigh * 0.16f - terrain.altitudeKm * 0.035f, 0.04f, 1.05f);
         cells[i].humidity = ClampFloat(relativeHumidity * saturation, 0.0f, 1.35f);
         cells[i].cloud = ClampFloat(0.03f + initializationItcz * 0.10f + initializationStormTrack * 0.09f + WeatherRelativeHumidity(cells[i].humidity, cells[i].temperature) * 0.22f + (forcing.moistureWave - 0.5f) * 0.06f - initializationHigh * 0.06f + terrain.mountain * 0.08f, 0.0f, 1.0f);
         cells[i].precipitation = 0.0f;
@@ -1050,7 +1129,7 @@ static void InitializeWeather(WeatherCell *cells, const Tile *tiles, int count, 
         cells[i].storm = 0.0f;
         cells[i].surfaceTemperature = cells[i].temperature;
         cells[i].oceanTemperature = cells[i].temperature;
-        cells[i].soilMoisture = ClampFloat(terrain.land * (0.08f + relativeHumidity * 0.34f + initializationStormTrack * 0.14f + terrain.coast * 0.10f - initializationHigh * 0.11f - terrain.altitudeKm * 0.025f), 0.0f, 1.0f);
+        cells[i].soilMoisture = ClampFloat(terrain.land * liquidWaterFactor * (0.08f + relativeHumidity * 0.34f + initializationStormTrack * 0.14f + terrain.coast * 0.10f - initializationHigh * 0.11f - terrain.altitudeKm * 0.025f), 0.0f, 1.0f);
         cells[i].cloudWater = cells[i].cloud * 0.35f;
         cells[i].recentRain = 0.0f;
         cells[i].rainShadow = 0.0f;
@@ -1205,7 +1284,8 @@ static void StepWeatherSimulation(
         float land = terrain.land;
         float signedClimateLatitude = Vector3DotProduct(c->normal, solar->northPole);
         float albedo = ClampFloat(0.06f * terrain.ocean + 0.21f * land + 0.48f * c->snow + 0.18f * c->cloud, 0.0f, 0.82f);
-        float seaLevelTemperatureC = LerpFloat(-31.0f, 34.0f, powf(forcing.equatorHeat, 0.80f));
+        float meanTemperatureC = ClimateMeanSeaLevelTemperatureC(solar);
+        float seaLevelTemperatureC = meanTemperatureC + (powf(forcing.equatorHeat, 0.80f) - 0.55f) * (76.0f * climate->temperatureContrast);
         seaLevelTemperatureC += land * (forcing.equatorHeat - 0.46f) * (10.0f * climate->temperatureContrast);
         seaLevelTemperatureC += terrain.ocean * (WeatherTemperatureC(c->oceanTemperature) - seaLevelTemperatureC) * 0.18f;
         seaLevelTemperatureC += terrain.coast * (WeatherTemperatureC(c->oceanTemperature) - seaLevelTemperatureC) * 0.08f;
@@ -1293,7 +1373,7 @@ static void StepWeatherSimulation(
         }
 
         float sunDot = SolarFacingAmount(c->normal, solar->lightDir);
-        float daylightHeating = climate->dayNightEnabled ? fmaxf(0.0f, sunDot) * (0.16f * climate->solarIntensity) : 0.08f;
+        float daylightHeating = climate->dayNightEnabled ? fmaxf(0.0f, sunDot) * (0.16f * powf(fmaxf(solar->stellarFlux, 0.0001f), 0.25f)) : 0.08f;
         float radiativeCooling = climate->dayNightEnabled ? fmaxf(0.0f, -sunDot) * (0.10f + land * 0.05f) : 0.0f;
 
         float upslopeFlow = ClampFloat(Vector3DotProduct(wind, terrainGradient) * 18.0f, 0.0f, 1.0f);
@@ -1318,7 +1398,8 @@ static void StepWeatherSimulation(
         // Surface pass: land reacts quickly, ocean carries heat with much higher inertia.
         float oceanTemperature = c->oceanTemperature;
         oceanTemperature += flux->oceanTemperature;
-        float oceanBaseC = LerpFloat(-2.0f, 30.0f, powf(forcing.equatorHeat, 0.88f)) + daylightHeating * 2.8f - radiativeCooling * 1.2f;
+        float liquidWaterFactor = ClimateLiquidWaterFactor(solar);
+        float oceanBaseC = meanTemperatureC + (powf(forcing.equatorHeat, 0.88f) - 0.54f) * 42.0f + daylightHeating * 2.8f - radiativeCooling * 1.2f;
         float upwellingC = terrain.coast * (1.0f - upwindOcean) * (5.5f + terrain.oceanDepthKm * 0.45f);
         float oceanTempTarget = WeatherTemperature01FromC(oceanBaseC - upwellingC - terrain.oceanDepthKm * 0.35f);
         float oceanInertia = 0.035f * c->ocean;
@@ -1343,13 +1424,13 @@ static void StepWeatherSimulation(
         float humidity = c->humidity;
         humidity += flux->humidity;
         float saturation = WeatherSaturation(temperature);
-        float coastalMoisture = ClampFloat(oceanAvg * 0.38f + upwindOcean * 0.78f + terrain.coast * 0.34f, 0.0f, 1.0f);
+        float coastalMoisture = ClampFloat((oceanAvg * 0.38f + upwindOcean * 0.78f + terrain.coast * 0.34f) * liquidWaterFactor, 0.0f, 1.0f);
         float landWetness = ClampFloat(
             c->soilMoisture * 0.62f + c->recentRain * 0.64f + coastalMoisture * 0.20f + c->cloudWater * 0.18f + c->snow * 0.22f,
             0.0f,
             1.0f
         );
-        float surfaceWetness = ClampFloat(c->ocean + land * landWetness, 0.0f, 1.0f);
+        float surfaceWetness = ClampFloat(c->ocean * liquidWaterFactor + land * landWetness, 0.0f, 1.0f);
         float evaporationSurfaceTemp = LerpFloat(surfaceTemperature, oceanTemperature, c->ocean);
         float humidityDeficit = ClampFloat((saturation - humidity + 0.16f) / 0.84f, 0.0f, 1.0f);
         float climateRelativeHumidity = ClampFloat(0.32f + c->ocean * 0.40f + coastalMoisture * 0.30f + land * c->soilMoisture * 0.30f + forcing.itcz * 0.15f + forcing.stormTrack * 0.08f - forcing.subtropicalHigh * 0.18f - terrain.altitudeKm * 0.030f - rainShadow * 0.33f - c->airMassAge * land * 0.08f, 0.08f, 1.10f);
@@ -2454,10 +2535,11 @@ static void DrawSunIndicator(Camera3D camera, const SolarState *solar)
 
     Vector2 sunScreen = GetWorldToScreen(sunWorld, camera);
     float radius = 18.0f;
-    DrawCircleV(sunScreen, radius * 4.6f, (Color){ 255, 210, 120, 18 });
-    DrawCircleV(sunScreen, radius * 3.1f, (Color){ 255, 220, 148, 34 });
-    DrawCircleV(sunScreen, radius * 2.0f, (Color){ 255, 234, 180, 62 });
-    DrawCircleV(sunScreen, radius * 1.1f, (Color){ 255, 244, 208, 246 });
+    Color star = solar->starColor;
+    DrawCircleV(sunScreen, radius * 4.6f, (Color){ star.r, star.g, star.b, 18 });
+    DrawCircleV(sunScreen, radius * 3.1f, (Color){ star.r, star.g, star.b, 34 });
+    DrawCircleV(sunScreen, radius * 2.0f, (Color){ star.r, star.g, star.b, 72 });
+    DrawCircleV(sunScreen, radius * 1.1f, (Color){ 255, 248, 226, 246 });
 }
 
 static void DrawSunOrbitGuide(Camera3D camera, const SolarState *solar)
@@ -2561,7 +2643,8 @@ static void DrawPlanetTiles(
     bool showPlateView,
     bool weatherEnabled,
     WeatherViewMode weatherView,
-    int selectedTile
+    int selectedTile,
+    const SolarState *solar
 )
 {
     Color wire = (Color){ 16, 24, 20, 255 };
@@ -2594,7 +2677,7 @@ static void DrawPlanetTiles(
             if (winding < 0.0f) faceNormal = Vector3Scale(faceNormal, -1.0f);
             if (Vector3LengthSqr(faceNormal) > 0.000001f) faceNormal = Vector3Normalize(faceNormal);
             else faceNormal = Vector3Normalize(tile->center);
-            Color triFill = isSelected ? fill : ShadeSurfaceColor(fill, faceNormal, showPlateView ? 0.16f : 0.44f);
+            Color triFill = isSelected ? fill : ShadeSurfaceColor(fill, faceNormal, showPlateView ? 0.16f : 0.44f, solar);
             if (winding >= 0.0f) DrawTriangle3D(tile->center, a, b, triFill);
             else DrawTriangle3D(tile->center, b, a, triFill);
 
@@ -2785,9 +2868,9 @@ static void WeatherLegendLabels(WeatherViewMode mode, char *low, int lowSize, ch
     switch (mode) {
         case WEATHER_VIEW_TEMPERATURE:
         case WEATHER_VIEW_OCEAN_TEMP:
-            snprintf(low, (size_t)lowSize, "-45 C");
-            snprintf(mid, (size_t)midSize, "0 C");
-            snprintf(high, (size_t)highSize, "45 C");
+            snprintf(low, (size_t)lowSize, "-120 C");
+            snprintf(mid, (size_t)midSize, "-12 C");
+            snprintf(high, (size_t)highSize, "95 C");
             break;
         case WEATHER_VIEW_PRESSURE:
             snprintf(low, (size_t)lowSize, "low 780 hPa");
@@ -2860,7 +2943,8 @@ static void DrawWeatherColorLegend(WeatherViewMode mode, bool weatherEnabled, bo
     float screenHeight = (float)GetScreenHeight();
     float width = fminf(520.0f, screenWidth - 36.0f);
     float height = 66.0f;
-    Rectangle bounds = { (screenWidth - width) * 0.5f, screenHeight - height - 18.0f, width, height };
+    float bottomMargin = (screenHeight < 760.0f) ? 92.0f : 78.0f;
+    Rectangle bounds = { (screenWidth - width) * 0.5f, screenHeight - height - bottomMargin, width, height };
     Rectangle bar = { bounds.x + 18.0f, bounds.y + 30.0f, bounds.width - 36.0f, 14.0f };
 
     Color lowColor;
@@ -2905,8 +2989,9 @@ static bool gClimateChartsPositionInitialized = false;
 static Rectangle ControlPanelBounds(void)
 {
     float width = 418.0f;
-    float height = (float)GetScreenHeight() - 36.0f;
-    if (height < 520.0f) height = 520.0f;
+    float screenHeight = (float)GetScreenHeight();
+    float height = fmaxf(320.0f, screenHeight - 36.0f);
+    height = fminf(height, fmaxf(120.0f, screenHeight - 36.0f));
     float x = fmaxf(18.0f, (float)GetScreenWidth() - width - 18.0f);
     return (Rectangle){ x, 18.0f, width, height };
 }
@@ -3142,6 +3227,10 @@ static bool DrawControlPanel(
     PanelDrawTextRow(&layout, "Solar Clock", summary);
     snprintf(summary, sizeof(summary), "Sun %.0f deg", asinf(SolarFacingAmount(solar->lightDir, solar->northPole)) * RAD2DEG);
     PanelDrawTextRow(&layout, "Declination", summary);
+    snprintf(summary, sizeof(summary), "%.2f AU  %.2fx flux", solar->orbitDistanceAu, solar->stellarFlux);
+    PanelDrawTextRow(&layout, "Orbit", summary);
+    snprintf(summary, sizeof(summary), "%s  %.1f C", ClimateOrbitStatus(solar), ClimateMeanSeaLevelTemperatureC(solar));
+    PanelDrawTextRow(&layout, "Climate", summary);
     snprintf(summary, sizeof(summary), "FPS %.1f", GetFPS() * 1.0f);
     PanelDrawTextRow(&layout, "Performance", summary);
 
@@ -3164,7 +3253,12 @@ static bool DrawControlPanel(
     PanelSliderFloat(&layout, "Day Speed", &climate->daySpeed, 0.0f, 4.0f, "%.2fx");
     PanelSliderFloat(&layout, "Year Speed", &climate->yearSpeed, 0.0f, 4.0f, "%.2fx");
     PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 45.0f, "%.1f deg");
-    PanelSliderFloat(&layout, "Solar Intensity", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
+    PanelSliderFloat(&layout, "Orbit Distance", &climate->orbitDistanceAu, 0.20f, 5.00f, "%.2f AU");
+    PanelSliderFloat(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, 0.0f, 0.65f, "%.2f");
+    PanelSliderFloat(&layout, "Star Luminosity", &climate->stellarLuminosity, 0.05f, 5.00f, "%.2f L");
+    PanelSliderFloat(&layout, "Star Color Temp", &climate->stellarTemperatureK, 2500.0f, 10000.0f, "%.0f K");
+    PanelSliderFloat(&layout, "Sun Brightness", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
+    PanelSliderFloat(&layout, "Greenhouse", &climate->greenhouseC, -30.0f, 65.0f, "%.0f C");
 
     PanelDrawSectionTitle(&layout, "Weather And Atmosphere");
     PanelSliderFloat(&layout, "Weather Speed", &climate->weatherTimeScale, 0.25f, 6.0f, "%.2fx");
@@ -3778,6 +3872,7 @@ int main(void)
     int atmospherePlanetRadiusLoc = GetShaderLocation(atmosphereShader, "planetRadius");
     int atmosphereAtmosphereRadiusLoc = GetShaderLocation(atmosphereShader, "atmosphereRadius");
     int atmosphereLightDirLoc = GetShaderLocation(atmosphereShader, "lightDir");
+    int atmosphereStarColorLoc = GetShaderLocation(atmosphereShader, "starColor");
     int atmosphereScatteringCoefficientsLoc = GetShaderLocation(atmosphereShader, "scatteringCoefficients");
     int atmosphereDensityFalloffLoc = GetShaderLocation(atmosphereShader, "densityFalloff");
     int atmosphereScatteringStrengthLoc = GetShaderLocation(atmosphereShader, "scatteringStrength");
@@ -3795,6 +3890,11 @@ int main(void)
         .yearSpeed = 1.0f,
         .axialTiltDegrees = 23.5f,
         .solarIntensity = 1.0f,
+        .orbitDistanceAu = 1.0f,
+        .orbitEccentricity = 0.0167f,
+        .stellarLuminosity = 1.0f,
+        .stellarTemperatureK = 5778.0f,
+        .greenhouseC = 0.0f,
         .weatherTimeScale = WEATHER_TIME_SCALE,
         .temperatureContrast = 1.0f,
         .atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF,
@@ -3806,6 +3906,7 @@ int main(void)
 
     Vector3 atmosphereScatterCoefficients = AtmosphereScatterCoefficients(ATMOSPHERE_SCATTERING_STRENGTH);
     Vector3 sunLightDirection = SunLightDirection(&solar);
+    Vector3 starColor = { (float)solar.starColor.r / 255.0f, (float)solar.starColor.g / 255.0f, (float)solar.starColor.b / 255.0f };
     float atmospherePlanetRadius = PLANET_RADIUS;
     float atmosphereOuterRadius = PLANET_RADIUS + ATMOSPHERE_SURFACE_MARGIN;
     float atmosphereDensityFalloff = climate.atmosphereDensityFalloff;
@@ -3814,6 +3915,7 @@ int main(void)
     SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
     SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
     SetShaderValue(atmosphereShader, atmosphereLightDirLoc, &sunLightDirection.x, SHADER_UNIFORM_VEC3);
+    SetShaderValue(atmosphereShader, atmosphereStarColorLoc, &starColor.x, SHADER_UNIFORM_VEC3);
     SetShaderValue(atmosphereShader, atmosphereScatteringCoefficientsLoc, &atmosphereScatterCoefficients.x, SHADER_UNIFORM_VEC3);
     SetShaderValue(atmosphereShader, atmosphereDensityFalloffLoc, &atmosphereDensityFalloff, SHADER_UNIFORM_FLOAT);
     SetShaderValue(atmosphereShader, atmosphereScatteringStrengthLoc, &atmosphereScatteringStrength, SHADER_UNIFORM_FLOAT);
@@ -3908,9 +4010,11 @@ int main(void)
         }
         solar = BuildSolarState(&climate);
         sunLightDirection = SunLightDirection(&solar);
+        starColor = (Vector3){ (float)solar.starColor.r / 255.0f, (float)solar.starColor.g / 255.0f, (float)solar.starColor.b / 255.0f };
         atmosphereDensityFalloff = climate.atmosphereDensityFalloff;
         atmosphereScatteringStrength = climate.atmosphereScatteringScale;
         SetShaderValue(atmosphereShader, atmosphereLightDirLoc, &sunLightDirection.x, SHADER_UNIFORM_VEC3);
+        SetShaderValue(atmosphereShader, atmosphereStarColorLoc, &starColor.x, SHADER_UNIFORM_VEC3);
         SetShaderValue(atmosphereShader, atmosphereDensityFalloffLoc, &atmosphereDensityFalloff, SHADER_UNIFORM_FLOAT);
         SetShaderValue(atmosphereShader, atmosphereScatteringStrengthLoc, &atmosphereScatteringStrength, SHADER_UNIFORM_FLOAT);
 
@@ -3968,7 +4072,7 @@ int main(void)
         BeginTextureMode(sceneTexture);
         ClearBackground((Color){ 0, 0, 0, 0 });
         BeginMode3D(camera);
-        DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile);
+        DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile, &solar);
         if (climate.showTiltAxis) DrawTiltAxisGuide(tiles, tileCount, &solar);
         if (!showPlateView && weatherEnabled) DrawWeatherClouds(tiles, weatherA, tileCount, weatherView);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_WIND) DrawWindVectors(tiles, weatherA, tileCount);
