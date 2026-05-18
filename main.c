@@ -2973,16 +2973,17 @@ static void DrawWeatherColorLegend(WeatherViewMode mode, bool weatherEnabled, bo
 
     float screenWidth = (float)GetScreenWidth();
     float screenHeight = (float)GetScreenHeight();
-    float rightEdge = screenWidth;
-    if (panelOpen) {
-        Rectangle panelBounds = ControlPanelBounds();
-        rightEdge = fmaxf(300.0f, panelBounds.x - 18.0f);
-    }
-    float width = fminf(520.0f, rightEdge - 36.0f);
+    float width = fminf(520.0f, screenWidth - 36.0f);
     width = fmaxf(260.0f, width);
     float height = 66.0f;
     float bottomMargin = (screenHeight < 760.0f) ? 92.0f : 78.0f;
-    Rectangle bounds = { fmaxf(18.0f, (rightEdge - width) * 0.5f), screenHeight - height - bottomMargin, width, height };
+    float x = (screenWidth - width) * 0.5f;
+    if (panelOpen) {
+        Rectangle panelBounds = ControlPanelBounds();
+        float panelClearX = panelBounds.x - 18.0f;
+        if (x + width > panelClearX) x = panelClearX - width;
+    }
+    Rectangle bounds = { fmaxf(18.0f, x), screenHeight - height - bottomMargin, width, height };
     Rectangle bar = { bounds.x + 18.0f, bounds.y + 30.0f, bounds.width - 36.0f, 14.0f };
 
     Color lowColor;
