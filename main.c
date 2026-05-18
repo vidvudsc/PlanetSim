@@ -12,7 +12,7 @@
 
 #define PLANET_RADIUS 1.8f
 #define SEA_LEVEL 0.0f
-#define SUBDIVISIONS 6
+#define SUBDIVISIONS 5
 #define MAX_TILE_CORNERS 8
 #define POLY_BLEND_TANGENT 0.004f
 #define POLY_BLEND_RADIAL 0.000f
@@ -176,6 +176,18 @@ typedef struct ClimateSettings {
     float stellarLuminosity;
     float stellarTemperatureK;
     float greenhouseC;
+    float orbitDistanceRangeMin;
+    float orbitDistanceRangeMax;
+    float orbitEccentricityRangeMin;
+    float orbitEccentricityRangeMax;
+    float stellarLuminosityRangeMin;
+    float stellarLuminosityRangeMax;
+    float stellarTemperatureRangeMin;
+    float stellarTemperatureRangeMax;
+    float greenhouseRangeMin;
+    float greenhouseRangeMax;
+    float temperatureContrastRangeMin;
+    float temperatureContrastRangeMax;
     float weatherTimeScale;
     float temperatureContrast;
     float atmosphereDensityFalloff;
@@ -3175,6 +3187,54 @@ static bool PanelSliderFloat(PanelLayout *layout, const char *label, float *valu
     return changed;
 }
 
+static void ExpandPanelSliderRange(float value, float *rangeMin, float *rangeMax, float floorValue, float ceilingValue, float minSpan)
+{
+    if (*rangeMax - *rangeMin < minSpan) {
+        *rangeMin = value - minSpan * 0.5f;
+        *rangeMax = value + minSpan * 0.5f;
+    }
+    if (value < *rangeMin) *rangeMin = value;
+    if (value > *rangeMax) *rangeMax = value;
+
+    float span = fmaxf(minSpan, *rangeMax - *rangeMin);
+    if (value < *rangeMin + span * 0.08f) *rangeMin -= span * 0.45f;
+    if (value > *rangeMax - span * 0.08f) *rangeMax += span * 0.45f;
+
+    if (floorValue > -FLT_MAX * 0.5f && *rangeMin < floorValue) *rangeMin = floorValue;
+    if (ceilingValue < FLT_MAX * 0.5f && *rangeMax > ceilingValue) *rangeMax = ceilingValue;
+    if (*rangeMax - *rangeMin < minSpan) {
+        float center = ClampFloat(value, *rangeMin, *rangeMax);
+        *rangeMin = center - minSpan * 0.5f;
+        *rangeMax = center + minSpan * 0.5f;
+        if (floorValue > -FLT_MAX * 0.5f && *rangeMin < floorValue) {
+            *rangeMax += floorValue - *rangeMin;
+            *rangeMin = floorValue;
+        }
+        if (ceilingValue < FLT_MAX * 0.5f && *rangeMax > ceilingValue) {
+            *rangeMin -= *rangeMax - ceilingValue;
+            *rangeMax = ceilingValue;
+        }
+    }
+}
+
+static bool PanelSliderFloatAutoRange(
+    PanelLayout *layout,
+    const char *label,
+    float *value,
+    float *rangeMin,
+    float *rangeMax,
+    float floorValue,
+    float ceilingValue,
+    float minSpan,
+    const char *format
+)
+{
+    ExpandPanelSliderRange(*value, rangeMin, rangeMax, floorValue, ceilingValue, minSpan);
+    bool changed = PanelSliderFloat(layout, label, value, *rangeMin, *rangeMax, format);
+    ExpandPanelSliderRange(*value, rangeMin, rangeMax, floorValue, ceilingValue, minSpan);
+    return changed;
+}
+
 static void PanelDrawWeatherViewSelector(PanelLayout *layout, WeatherViewMode *weatherView)
 {
     Rectangle row = PanelConsumeRect(layout, 28.0f);
@@ -3300,18 +3360,18 @@ static bool DrawControlPanel(
     PanelSliderFloat(&layout, "Year Speed", &climate->yearSpeed, 0.0f, 4.0f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Orbit");
-    PanelSliderFloat(&layout, "Orbit Distance", &climate->orbitDistanceAu, 0.05f, 20.00f, "%.2f AU");
-    PanelSliderFloat(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, 0.0f, 0.85f, "%.2f");
+    PanelSliderFloatAutoRange(&layout, "Orbit Distance", &climate->orbitDistanceAu, &climate->orbitDistanceRangeMin, &climate->orbitDistanceRangeMax, 0.001f, FLT_MAX, 0.20f, "%.2f AU");
+    PanelSliderFloatAutoRange(&layout, "Orbit Eccentricity", &climate->orbitEccentricity, &climate->orbitEccentricityRangeMin, &climate->orbitEccentricityRangeMax, 0.0f, 0.98f, 0.08f, "%.2f");
     PanelSliderFloat(&layout, "Axial Tilt", &climate->axialTiltDegrees, 0.0f, 89.0f, "%.1f deg");
 
     PanelDrawSectionTitle(&layout, "Star");
-    PanelSliderFloat(&layout, "Star Luminosity", &climate->stellarLuminosity, 0.01f, 50.00f, "%.2f L");
-    PanelSliderFloat(&layout, "Star Color Temp", &climate->stellarTemperatureK, 1800.0f, 12000.0f, "%.0f K");
+    PanelSliderFloatAutoRange(&layout, "Star Luminosity", &climate->stellarLuminosity, &climate->stellarLuminosityRangeMin, &climate->stellarLuminosityRangeMax, 0.001f, FLT_MAX, 0.25f, "%.2f L");
+    PanelSliderFloatAutoRange(&layout, "Star Color Temp", &climate->stellarTemperatureK, &climate->stellarTemperatureRangeMin, &climate->stellarTemperatureRangeMax, 300.0f, FLT_MAX, 400.0f, "%.0f K");
     PanelSliderFloat(&layout, "Sun Brightness", &climate->solarIntensity, 0.35f, 1.65f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Climate");
-    PanelSliderFloat(&layout, "Greenhouse", &climate->greenhouseC, -30.0f, 65.0f, "%.0f C");
-    PanelSliderFloat(&layout, "Temp Contrast", &climate->temperatureContrast, 0.50f, 1.80f, "%.2fx");
+    PanelSliderFloatAutoRange(&layout, "Greenhouse", &climate->greenhouseC, &climate->greenhouseRangeMin, &climate->greenhouseRangeMax, -FLT_MAX, FLT_MAX, 10.0f, "%.0f C");
+    PanelSliderFloatAutoRange(&layout, "Temp Contrast", &climate->temperatureContrast, &climate->temperatureContrastRangeMin, &climate->temperatureContrastRangeMax, 0.0f, FLT_MAX, 0.20f, "%.2fx");
 
     PanelDrawSectionTitle(&layout, "Weather And Atmosphere");
     PanelSliderFloat(&layout, "Weather Speed", &climate->weatherTimeScale, 0.25f, 6.0f, "%.2fx");
@@ -3949,6 +4009,18 @@ int main(void)
         .stellarLuminosity = 1.0f,
         .stellarTemperatureK = 5778.0f,
         .greenhouseC = 0.0f,
+        .orbitDistanceRangeMin = 0.20f,
+        .orbitDistanceRangeMax = 5.00f,
+        .orbitEccentricityRangeMin = 0.0f,
+        .orbitEccentricityRangeMax = 0.65f,
+        .stellarLuminosityRangeMin = 0.05f,
+        .stellarLuminosityRangeMax = 5.00f,
+        .stellarTemperatureRangeMin = 1800.0f,
+        .stellarTemperatureRangeMax = 12000.0f,
+        .greenhouseRangeMin = -30.0f,
+        .greenhouseRangeMax = 65.0f,
+        .temperatureContrastRangeMin = 0.50f,
+        .temperatureContrastRangeMax = 1.80f,
         .weatherTimeScale = WEATHER_TIME_SCALE,
         .temperatureContrast = 1.0f,
         .atmosphereDensityFalloff = ATMOSPHERE_DENSITY_FALLOFF,
