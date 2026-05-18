@@ -3985,9 +3985,7 @@ int main(void)
     ClimateChartHistory climateCharts = { 0 };
     ResetClimateChartHistory(&climateCharts);
     UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
-    atmospherePlanetRadius = MaxSurfaceRadius(tiles, tileCount);
-    atmosphereOuterRadius = atmospherePlanetRadius + ATMOSPHERE_SURFACE_MARGIN;
-    SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
+    atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
     SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
 
     OrbitCamera orbit = {
@@ -4023,7 +4021,8 @@ int main(void)
         bool sidebarToggleHovered = CheckCollisionPointRec(GetMousePosition(), sidebarToggleRect);
         bool climateChartsHovered = showClimateCharts && CheckCollisionPointRec(GetMousePosition(), ClimateChartsBounds(showClimateChartsCollapsed));
         bool climateChartsCapturing = showClimateCharts && gPanelActiveWidgetId <= -220;
-        bool uiHovered = controlPanelHovered || sidebarToggleHovered || climateChartsHovered || climateChartsCapturing;
+        bool uiCapturing = gPanelActiveWidgetId != 0;
+        bool uiHovered = controlPanelHovered || sidebarToggleHovered || climateChartsHovered || climateChartsCapturing || uiCapturing;
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !uiHovered) clickStart = GetMousePosition();
         if (IsKeyPressed(KEY_A)) atmosphereEnabled = !atmosphereEnabled;
         if (IsKeyPressed(KEY_C)) showPlateView = !showPlateView;
@@ -4077,9 +4076,7 @@ int main(void)
             if (tectonicRebuildTimer >= tectonicRebuildStep) {
                 tectonicRebuildTimer -= tectonicRebuildStep;
                 UpdatePlanetTiles(tiles, tileCount, triangleDirections, triangleSurfacePoints, triangles.count, plates, plateCount, PLANET_RADIUS);
-                atmospherePlanetRadius = MaxSurfaceRadius(tiles, tileCount);
-                atmosphereOuterRadius = atmospherePlanetRadius + ATMOSPHERE_SURFACE_MARGIN;
-                SetShaderValue(atmosphereShader, atmospherePlanetRadiusLoc, &atmospherePlanetRadius, SHADER_UNIFORM_FLOAT);
+                atmosphereOuterRadius = MaxSurfaceRadius(tiles, tileCount) + ATMOSPHERE_SURFACE_MARGIN;
                 SetShaderValue(atmosphereShader, atmosphereAtmosphereRadiusLoc, &atmosphereOuterRadius, SHADER_UNIFORM_FLOAT);
             }
         }
