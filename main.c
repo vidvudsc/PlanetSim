@@ -2554,9 +2554,13 @@ static void DrawSunBillboard(Camera3D camera, const SolarState *solar, Texture2D
     Color hotCore = LerpColor(star, (Color){ 255, 252, 232, 255 }, 0.72f);
 
     Rectangle source = { 0.0f, 0.0f, (float)sunGlowTexture.width, (float)sunGlowTexture.height };
+    rlDrawRenderBatchActive();
+    rlDisableDepthMask();
     DrawBillboardPro(camera, sunGlowTexture, source, sunWorld, up, (Vector2){ haloRadius * 2.0f, haloRadius * 2.0f }, (Vector2){ haloRadius, haloRadius }, 0.0f, (Color){ warmCorona.r, warmCorona.g, warmCorona.b, 46 });
     DrawBillboardPro(camera, sunGlowTexture, source, sunWorld, up, (Vector2){ coreRadius * 5.0f, coreRadius * 5.0f }, (Vector2){ coreRadius * 2.5f, coreRadius * 2.5f }, 0.0f, (Color){ star.r, star.g, star.b, 98 });
     DrawBillboardPro(camera, sunGlowTexture, source, sunWorld, up, (Vector2){ coreRadius * 2.0f, coreRadius * 2.0f }, (Vector2){ coreRadius, coreRadius }, 0.0f, (Color){ hotCore.r, hotCore.g, hotCore.b, 246 });
+    rlDrawRenderBatchActive();
+    rlEnableDepthMask();
 }
 
 static void DrawSunOrbitGuide(Camera3D camera, const SolarState *solar)
