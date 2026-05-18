@@ -2560,6 +2560,36 @@ static void DrawTiltAxisGuide(const Tile *tiles, int tileCount, const SolarState
     DrawCylinderEx(Vector3Scale(planetUp, -innerRadius), Vector3Scale(planetUp, -outerRadius * 0.92f), 0.010f, 0.010f, 10, (Color){ 248, 250, 255, 185 });
 }
 
+struct MoonRender {
+    Shader shader;
+    Model model;
+    int lightDirLoc;
+    int moonColorLoc;
+    int moonDarkColorLoc;
+    bool ready;
+};
+static MoonRender gMoonRender = {};
+
+static void InitMoonRender(void)
+{
+    gMoonRender.shader = LoadShader("shaders/moon.vs", "shaders/moon.fs");
+    gMoonRender.lightDirLoc      = GetShaderLocation(gMoonRender.shader, "lightDir");
+    gMoonRender.moonColorLoc     = GetShaderLocation(gMoonRender.shader, "moonColor");
+    gMoonRender.moonDarkColorLoc = GetShaderLocation(gMoonRender.shader, "moonDarkColor");
+    Mesh m = GenMeshSphere(1.0f, 28, 36);
+    gMoonRender.model = LoadModelFromMesh(m);
+    gMoonRender.model.materials[0].shader = gMoonRender.shader;
+    gMoonRender.ready = true;
+}
+
+static void ShutdownMoonRender(void)
+{
+    if (!gMoonRender.ready) return;
+    UnloadModel(gMoonRender.model);
+    UnloadShader(gMoonRender.shader);
+    gMoonRender.ready = false;
+}
+
 static void DrawMoonsAndOrbits3D(const ClimateSettings *climate, const SolarState *solar)
 {
     if (climate->moonCount <= 0) return;
@@ -2568,6 +2598,19 @@ static void DrawMoonsAndOrbits3D(const ClimateSettings *climate, const SolarStat
     Vector3 ex = Vector3Normalize(Vector3CrossProduct((Vector3){ 0.0f, 1.0f, 0.0f }, axis));
     if (Vector3LengthSqr(ex) < 1e-4f) ex = (Vector3){ 1.0f, 0.0f, 0.0f };
     Vector3 ez = Vector3Normalize(Vector3CrossProduct(axis, ex));
+
+    // Per-moon tint variation (slight greys/tans)
+    static const Vector3 kMoonLit[MAX_MOONS]  = {
+        { 0.85f, 0.83f, 0.80f }, { 0.78f, 0.72f, 0.66f },
+        { 0.82f, 0.80f, 0.83f }, { 0.74f, 0.76f, 0.80f },
+    };
+    static const Vector3 kMoonDark[MAX_MOONS] = {
+        { 0.05f, 0.05f, 0.07f }, { 0.06f, 0.05f, 0.04f },
+        { 0.05f, 0.05f, 0.06f }, { 0.04f, 0.05f, 0.06f },
+    };
+
+    Vector3 lightDir = solar->lightDir;
+    SetShaderValue(gMoonRender.shader, gMoonRender.lightDirLoc, &lightDir, SHADER_UNIFORM_VEC3);
 
     for (int mi = 0; mi < climate->moonCount && mi < MAX_MOONS; mi++) {
         const MoonConfig *m = &climate->moons[mi];
@@ -2589,17 +2632,22 @@ static void DrawMoonsAndOrbits3D(const ClimateSettings *climate, const SolarStat
             float th = (float)i / (float)seg * 2.0f * PI;
             Vector3 p = Vector3Add(Vector3Scale(mAx, orbitR * cosf(th)),
                                    Vector3Scale(mAy, orbitR * sinf(th)));
-            if (havePrev) DrawLine3D(prev, p, (Color){ 180, 188, 220, 130 });
+            if (havePrev) DrawLine3D(prev, p, (Color){ 180, 188, 220, 100 });
             prev = p;
             havePrev = true;
         }
 
-        // Moon body at current phase
+        // Moon body via shaded model
         float th = (m->phase + climate->dayPhase * (1.0f / fmaxf(0.25f, m->period))) * 2.0f * PI;
         Vector3 pos = Vector3Add(Vector3Scale(mAx, orbitR * cosf(th)),
                                  Vector3Scale(mAy, orbitR * sinf(th)));
-        DrawSphere(pos, moonR, (Color){ 222, 222, 232, 255 });
-        DrawSphereWires(pos, moonR * 1.02f, 6, 10, (Color){ 150, 156, 178, 160 });
+
+        Vector3 lit  = kMoonLit[mi % MAX_MOONS];
+        Vector3 dark = kMoonDark[mi % MAX_MOONS];
+        SetShaderValue(gMoonRender.shader, gMoonRender.moonColorLoc,     &lit,  SHADER_UNIFORM_VEC3);
+        SetShaderValue(gMoonRender.shader, gMoonRender.moonDarkColorLoc, &dark, SHADER_UNIFORM_VEC3);
+        DrawModelEx(gMoonRender.model, pos, (Vector3){ 0.0f, 1.0f, 0.0f }, 0.0f,
+                    (Vector3){ moonR, moonR, moonR }, WHITE);
     }
 }
 
@@ -3389,36 +3437,16 @@ static void UiDrawInspectorWindow(const Tile *tiles, const Plate *plates, const 
     ImGui::Separator();
 
     if (ImPlot::BeginPlot("##insphist", ImVec2(-1, 160),
-                          ImPlotFlags_NoTitle | ImPlotFlags_NoMenus | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
-        int count = g_ui.inspHistCount;
-        float linear[UiState::InspectorBins];
-        float yMin = 0.0f, yMax = 1.0f;
-        if (count > 1) {
-            int start = (g_ui.inspHistHead - count + UiState::InspectorBins) % UiState::InspectorBins;
-            yMin = +1e30f; yMax = -1e30f;
-            for (int i = 0; i < count; i++) {
-                float v = g_ui.inspHistory[(int)weatherView][(start + i) % UiState::InspectorBins];
-                linear[i] = v;
-                if (v < yMin) yMin = v;
-                if (v > yMax) yMax = v;
-            }
-            float span = yMax - yMin;
-            float minSpan = fmaxf(1e-3f, fabsf(yMax) * 0.05f + 0.5f);
-            if (span < minSpan) {
-                float c = (yMin + yMax) * 0.5f;
-                yMin = c - minSpan * 0.5f;
-                yMax = c + minSpan * 0.5f;
-            } else {
-                float pad = span * 0.12f;
-                yMin -= pad; yMax += pad;
-            }
-        }
+                          ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
         ImPlot::SetupAxes(nullptr, WeatherChartUnit(weatherView),
-                          ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_NoMenus,
-                          ImPlotAxisFlags_NoMenus);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, (double)(count > 1 ? count : 1), ImGuiCond_Always);
-        ImPlot::SetupAxisLimits(ImAxis_Y1, yMin, yMax, ImGuiCond_Always);
+                          ImPlotAxisFlags_NoTickLabels | ImPlotAxisFlags_NoGridLines | ImPlotAxisFlags_AutoFit,
+                          ImPlotAxisFlags_AutoFit);
+        int count = g_ui.inspHistCount;
         if (count > 1) {
+            float linear[UiState::InspectorBins];
+            int start = (g_ui.inspHistHead - count + UiState::InspectorBins) % UiState::InspectorBins;
+            for (int i = 0; i < count; i++)
+                linear[i] = g_ui.inspHistory[(int)weatherView][(start + i) % UiState::InspectorBins];
             ImPlotSpec spec;
             spec.LineColor = UiChartColor(weatherView);
             spec.LineWeight = 2.0f;
@@ -3492,10 +3520,11 @@ static void UiDrawLegendWindow(WeatherViewMode weatherView, bool weatherEnabled,
 
     int sh = GetScreenHeight();
     ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 116)), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(240, 100), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(260, 86), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSizeConstraints(ImVec2(200, 86), ImVec2(FLT_MAX, 86));
     ImGui::SetNextWindowBgAlpha(0.78f);
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar |
-                             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_AlwaysAutoResize;
+                             ImGuiWindowFlags_NoTitleBar;
     if (!ImGui::Begin("##legend", &g_ui.showLegend, flags)) { ImGui::End(); return; }
 
     Color low, mid, high;
@@ -3504,11 +3533,13 @@ static void UiDrawLegendWindow(WeatherViewMode weatherView, bool weatherEnabled,
     WeatherLegendLabels(weatherView, lowText, sizeof(lowText), midText, sizeof(midText), highText, sizeof(highText));
 
     ImGui::Text("%s", WeatherViewName(weatherView));
+
     ImVec2 p = ImGui::GetCursorScreenPos();
     float w = ImGui::GetContentRegionAvail().x;
+    if (w < 80.0f) w = 80.0f;
     float h = 14.0f;
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    int steps = 32;
+    const int steps = 48;
     for (int i = 0; i < steps; i++) {
         float t0 = (float)i / (float)steps;
         float t1 = (float)(i + 1) / (float)steps;
@@ -3522,11 +3553,16 @@ static void UiDrawLegendWindow(WeatherViewMode weatherView, bool weatherEnabled,
             ca, cb, cb, ca);
     }
     ImGui::Dummy(ImVec2(w, h));
-    ImGui::Text("%s", lowText);
-    ImGui::SameLine(w * 0.5f - ImGui::CalcTextSize(midText).x * 0.5f);
-    ImGui::Text("%s", midText);
-    ImGui::SameLine(w - ImGui::CalcTextSize(highText).x);
-    ImGui::Text("%s", highText);
+
+    // Labels positioned by absolute pixel coordinates so they cannot collide.
+    float labelY = p.y + h + 4.0f;
+    ImU32 textCol = IM_COL32(196, 214, 236, 245);
+    ImVec2 midSize  = ImGui::CalcTextSize(midText);
+    ImVec2 highSize = ImGui::CalcTextSize(highText);
+    dl->AddText(ImVec2(p.x,                            labelY), textCol, lowText);
+    dl->AddText(ImVec2(p.x + w * 0.5f - midSize.x * 0.5f, labelY), textCol, midText);
+    dl->AddText(ImVec2(p.x + w - highSize.x,           labelY), textCol, highText);
+    ImGui::Dummy(ImVec2(w, ImGui::GetTextLineHeight() + 2.0f));
 
     ImGui::End();
 }
@@ -3751,6 +3787,7 @@ int main(void)
 
     rlImGuiSetup(true);
     UiInit();
+    InitMoonRender();
 
     Image sunGlowImage = GenImageGradientRadial(256, 256, 0.08f, WHITE, BLANK);
     Texture2D sunGlowTexture = LoadTextureFromImage(sunGlowImage);
@@ -4043,6 +4080,7 @@ int main(void)
     UnloadRenderTexture(sceneTexture);
     UnloadShader(atmosphereShader);
 
+    ShutdownMoonRender();
     UiShutdown();
     rlImGuiShutdown();
     CloseWindow();
