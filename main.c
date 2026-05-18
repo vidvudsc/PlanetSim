@@ -285,6 +285,7 @@ static Vector3 TangentEastFromAxis(Vector3 normal, Vector3 climateNorth);
 static Vector3 TangentNorthFromAxis(Vector3 normal, Vector3 climateNorth);
 static Vector3 ClimateEddyFlowFromAxis(Vector3 normal, Vector3 climateNorth, float scale, Vector3 offset, float strength);
 static float MaxSurfaceRadius(const Tile *tiles, int tileCount);
+static Rectangle ControlPanelBounds(void);
 
 static float ClampFloat(float value, float minValue, float maxValue)
 {
@@ -2966,16 +2967,22 @@ static void WeatherLegendLabels(WeatherViewMode mode, char *low, int lowSize, ch
     }
 }
 
-static void DrawWeatherColorLegend(WeatherViewMode mode, bool weatherEnabled, bool showPlateView)
+static void DrawWeatherColorLegend(WeatherViewMode mode, bool weatherEnabled, bool showPlateView, bool panelOpen)
 {
     if (!weatherEnabled || showPlateView) return;
 
     float screenWidth = (float)GetScreenWidth();
     float screenHeight = (float)GetScreenHeight();
-    float width = fminf(520.0f, screenWidth - 36.0f);
+    float rightEdge = screenWidth;
+    if (panelOpen) {
+        Rectangle panelBounds = ControlPanelBounds();
+        rightEdge = fmaxf(300.0f, panelBounds.x - 18.0f);
+    }
+    float width = fminf(520.0f, rightEdge - 36.0f);
+    width = fmaxf(260.0f, width);
     float height = 66.0f;
     float bottomMargin = (screenHeight < 760.0f) ? 92.0f : 78.0f;
-    Rectangle bounds = { (screenWidth - width) * 0.5f, screenHeight - height - bottomMargin, width, height };
+    Rectangle bounds = { fmaxf(18.0f, (rightEdge - width) * 0.5f), screenHeight - height - bottomMargin, width, height };
     Rectangle bar = { bounds.x + 18.0f, bounds.y + 30.0f, bounds.width - 36.0f, 14.0f };
 
     Color lowColor;
@@ -4156,7 +4163,7 @@ int main(void)
         }
 
         DrawSelectedTileInfo(tiles, plates, weatherA, tileCount, selectedTile, tectonicsPaused, weatherEnabled, weatherView);
-        DrawWeatherColorLegend(weatherView, weatherEnabled, showPlateView);
+        DrawWeatherColorLegend(weatherView, weatherEnabled, showPlateView, climate.panelOpen);
         if (climate.panelOpen) {
             DrawControlPanel(&climate, &showPlateView, &atmosphereEnabled, &weatherEnabled, &tectonicsPaused, &weatherView, &resetWeatherRequested, &showClimateCharts, &solar);
         } else {
