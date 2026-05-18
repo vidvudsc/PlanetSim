@@ -179,6 +179,7 @@ typedef struct ClimateSettings {
     bool dayNightEnabled;
     bool seasonsEnabled;
     bool showSunOrbit;
+    bool showMoonOrbits;
     bool showTiltAxis;
     float dayPhase;
     float yearPhase;
@@ -2559,6 +2560,49 @@ static void DrawTiltAxisGuide(const Tile *tiles, int tileCount, const SolarState
     DrawCylinderEx(Vector3Scale(planetUp, -innerRadius), Vector3Scale(planetUp, -outerRadius * 0.92f), 0.010f, 0.010f, 10, (Color){ 248, 250, 255, 185 });
 }
 
+static void DrawMoonsAndOrbits3D(const ClimateSettings *climate, const SolarState *solar)
+{
+    if (climate->moonCount <= 0) return;
+
+    Vector3 axis = solar->northPole;
+    Vector3 ex = Vector3Normalize(Vector3CrossProduct((Vector3){ 0.0f, 1.0f, 0.0f }, axis));
+    if (Vector3LengthSqr(ex) < 1e-4f) ex = (Vector3){ 1.0f, 0.0f, 0.0f };
+    Vector3 ez = Vector3Normalize(Vector3CrossProduct(axis, ex));
+
+    for (int mi = 0; mi < climate->moonCount && mi < MAX_MOONS; mi++) {
+        const MoonConfig *m = &climate->moons[mi];
+        if (!m->enabled) continue;
+
+        float mInc = m->inclinationDeg * DEG2RAD;
+        Vector3 mAx = ex;
+        Vector3 mAy = Vector3Add(Vector3Scale(ez,   cosf(mInc)),
+                                 Vector3Scale(axis, sinf(mInc)));
+
+        float orbitR = m->distance * PLANET_RADIUS;
+        float moonR  = fmaxf(0.04f, m->radius * PLANET_RADIUS);
+
+        // Orbit ring
+        const int seg = 96;
+        Vector3 prev{};
+        bool havePrev = false;
+        for (int i = 0; i <= seg; i++) {
+            float th = (float)i / (float)seg * 2.0f * PI;
+            Vector3 p = Vector3Add(Vector3Scale(mAx, orbitR * cosf(th)),
+                                   Vector3Scale(mAy, orbitR * sinf(th)));
+            if (havePrev) DrawLine3D(prev, p, (Color){ 180, 188, 220, 130 });
+            prev = p;
+            havePrev = true;
+        }
+
+        // Moon body at current phase
+        float th = (m->phase + climate->dayPhase * (1.0f / fmaxf(0.25f, m->period))) * 2.0f * PI;
+        Vector3 pos = Vector3Add(Vector3Scale(mAx, orbitR * cosf(th)),
+                                 Vector3Scale(mAy, orbitR * sinf(th)));
+        DrawSphere(pos, moonR, (Color){ 222, 222, 232, 255 });
+        DrawSphereWires(pos, moonR * 1.02f, 6, 10, (Color){ 150, 156, 178, 160 });
+    }
+}
+
 static void DrawSpaceBackground(int screenWidth, int screenHeight, Camera3D camera, float clock)
 {
     DrawRectangleGradientV(0, 0, screenWidth, screenHeight, (Color){ 5, 8, 18, 255 }, (Color){ 1, 2, 7, 255 });
@@ -3225,7 +3269,7 @@ static void UiDrawControlsWindow(ClimateSettings &climate,
     ImGui::SetNextWindowSize(ImVec2(440, 600), ImGuiCond_FirstUseEver);
     if (!ImGui::Begin("Controls", &g_ui.showControls)) { ImGui::End(); return; }
 
-    const float kSlider = 180.0f;
+    const float kSlider = -150.0f;   // negative = "fill width, leave N px on the right for the label"
 
     if (ImGui::BeginTabBar("##ctlTabs")) {
         if (ImGui::BeginTabItem("Sim")) {
@@ -3264,6 +3308,7 @@ static void UiDrawControlsWindow(ClimateSettings &climate,
         if (ImGui::BeginTabItem("Atmosphere")) {
             ImGui::Checkbox("Atmosphere shader",  &atmosphereEnabled);
             ImGui::Checkbox("Show sun orbit",     &climate.showSunOrbit);
+            ImGui::Checkbox("Show moon orbits",   &climate.showMoonOrbits);
             ImGui::Checkbox("Show tilt axis",     &climate.showTiltAxis);
             ImGui::PushItemWidth(kSlider);
             ImGui::SliderFloat("Greenhouse",     &climate.greenhouseC,             -10.0f, 30.0f, "%.1f C");
@@ -3277,6 +3322,7 @@ static void UiDrawControlsWindow(ClimateSettings &climate,
             ImGui::PushItemWidth(kSlider);
             ImGui::SliderInt("Moon count", &climate.moonCount, 0, MAX_MOONS);
             ImGui::PopItemWidth();
+            ImGui::Checkbox("Show moon orbits in 3D view", &climate.showMoonOrbits);
             ImGui::TextDisabled("UI only for now; weather coupling lands in physics-rework.");
             ImGui::Separator();
             for (int i = 0; i < climate.moonCount; i++) {
@@ -3931,6 +3977,7 @@ int main(void)
         DrawSunBillboard(camera, &solar, sunGlowTexture);
         DrawPlanetTiles(tiles, weatherA, tileCount, showPlateView, weatherEnabled, weatherView, selectedTile, &solar);
         if (climate.showTiltAxis) DrawTiltAxisGuide(tiles, tileCount, &solar);
+        if (climate.showMoonOrbits) DrawMoonsAndOrbits3D(&climate, &solar);
         if (!showPlateView && weatherEnabled) DrawWeatherClouds(tiles, weatherA, tileCount, weatherView);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_WIND) DrawWindVectors(tiles, weatherA, tileCount);
         if (!showPlateView && weatherEnabled && weatherView == WEATHER_VIEW_CURRENT) DrawCurrentVectors(tiles, weatherA, tileCount);
