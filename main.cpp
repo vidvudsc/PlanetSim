@@ -3175,7 +3175,7 @@ struct UiState {
     int globalHistCount = 0;
     float globalHistYears = 0.0f;        // total elapsed planet years at most-recent sample
     float globalHistRollYears = 1.0f;    // visible window in planet years
-    bool chartsAutoFitY = true;
+    bool chartsAutoFollow = true;        // when on, X rolls with sim time and Y auto-fits
 
     // Charts metric
     WeatherViewMode chartsMode = WEATHER_VIEW_TEMPERATURE;
@@ -3503,22 +3503,27 @@ static void UiDrawChartsWindow()
     ImGui::SetNextItemWidth(150);
     ImGui::SliderFloat("##window", &g_ui.globalHistRollYears, 0.05f, 8.0f, "%.2f yr window");
     ImGui::SameLine();
-    ImGui::Checkbox("auto-fit Y", &g_ui.chartsAutoFitY);
+    ImGui::Checkbox("follow", &g_ui.chartsAutoFollow);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("on: X rolls with sim time, Y auto-fits.\noff: drag/scroll either axis to pan and zoom freely.");
 
     int count = g_ui.globalHistCount;
     int mode = (int)g_ui.chartsMode;
 
     if (ImPlot::BeginPlot("##chart", ImVec2(-1, -1),
                           ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
-        ImPlotAxisFlags yFlags = g_ui.chartsAutoFitY
-            ? ImPlotAxisFlags_AutoFit
-            : ImPlotAxisFlags_None;
-        ImPlot::SetupAxes("planet year", WeatherChartUnit(g_ui.chartsMode),
-                          ImPlotAxisFlags_None,
-                          yFlags);
-        double t1 = (double)g_ui.globalHistYears;
-        double t0 = t1 - (double)g_ui.globalHistRollYears;
-        ImPlot::SetupAxisLimits(ImAxis_X1, t0, t1, ImGuiCond_Always);
+        ImPlotAxisFlags xFlags = ImPlotAxisFlags_None;
+        ImPlotAxisFlags yFlags = g_ui.chartsAutoFollow ? ImPlotAxisFlags_AutoFit
+                                                       : ImPlotAxisFlags_None;
+        ImPlot::SetupAxes("planet year", WeatherChartUnit(g_ui.chartsMode), xFlags, yFlags);
+
+        if (g_ui.chartsAutoFollow) {
+            // X locked to the rolling window, Y AutoFit handles itself.
+            double t1 = (double)g_ui.globalHistYears;
+            double t0 = t1 - (double)g_ui.globalHistRollYears;
+            ImPlot::SetupAxisLimits(ImAxis_X1, t0, t1, ImGuiCond_Always);
+        }
+
         if (count > 1) {
             float xs[UiState::GlobalBins];
             float ys[UiState::GlobalBins];
@@ -3532,11 +3537,17 @@ static void UiDrawChartsWindow()
                 if (v < yMin) yMin = v;
                 if (v > yMax) yMax = v;
             }
-            // Seed initial Y range so manual-mode users start with the data in frame.
-            if (!g_ui.chartsAutoFitY && yMax > yMin) {
-                float pad = (yMax - yMin) * 0.12f + 0.5f;
-                ImPlot::SetupAxisLimits(ImAxis_Y1, yMin - pad, yMax + pad, ImGuiCond_Once);
+            // In manual mode, seed both axes so the chart starts framed; user can then pan freely.
+            if (!g_ui.chartsAutoFollow) {
+                if (yMax > yMin) {
+                    float pad = (yMax - yMin) * 0.12f + 0.5f;
+                    ImPlot::SetupAxisLimits(ImAxis_Y1, yMin - pad, yMax + pad, ImGuiCond_Once);
+                }
+                double t1 = (double)g_ui.globalHistYears;
+                double t0 = t1 - (double)g_ui.globalHistRollYears;
+                ImPlot::SetupAxisLimits(ImAxis_X1, t0, t1, ImGuiCond_Once);
             }
+
             ImPlotSpec spec;
             spec.LineColor = UiChartColor(g_ui.chartsMode);
             spec.LineWeight = 2.0f;
