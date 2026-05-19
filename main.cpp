@@ -3167,6 +3167,14 @@ struct UiState {
     int inspHistTile = -1;
     bool inspHistSampledThisFrame = false;
 
+    // Global rolling buffer for the climate-charts window
+    static const int GlobalBins = 720;
+    float globalHistory[WEATHER_VIEW_COUNT][GlobalBins]{};
+    int globalHistHead = 0;
+    int globalHistCount = 0;
+    float globalHistSimTime = 0.0f;     // total elapsed sim time at the most recent sample
+    float globalHistRollSeconds = 30.0f; // visible window width
+
     // Charts metric
     WeatherViewMode chartsMode = WEATHER_VIEW_TEMPERATURE;
 
@@ -3247,6 +3255,17 @@ static void UiEnsureOrbitTextureSize(int w, int h)
     g_ui.orbitTexH = h;
     g_ui.orbitTex = LoadRenderTexture(w, h);
     SetTextureFilter(g_ui.orbitTex.texture, TEXTURE_FILTER_BILINEAR);
+}
+
+static void UiPushGlobalSample(const ClimateChartHistory &history, float dt)
+{
+    g_ui.globalHistSimTime += dt;
+    int idx = g_ui.globalHistHead;
+    for (int m = 0; m < WEATHER_VIEW_COUNT; m++) {
+        g_ui.globalHistory[m][idx] = WeatherChartDisplayValue((WeatherViewMode)m, history.latest[m]);
+    }
+    g_ui.globalHistHead = (g_ui.globalHistHead + 1) % UiState::GlobalBins;
+    if (g_ui.globalHistCount < UiState::GlobalBins) g_ui.globalHistCount++;
 }
 
 static void UiPushInspectorSample(const WeatherCell *w, int selectedTile)
@@ -3459,12 +3478,12 @@ static void UiDrawInspectorWindow(const Tile *tiles, const Plate *plates, const 
     ImGui::End();
 }
 
-static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPhase)
+static void UiDrawChartsWindow()
 {
     if (!g_ui.showCharts) return;
     int sh = GetScreenHeight();
     ImGui::SetNextWindowPos(ImVec2(8.0f, (float)(sh - 280)), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(520, 260), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(560, 260), ImGuiCond_FirstUseEver);
     ImGuiWindowFlags wflags = ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
     if (!ImGui::Begin("Climate charts", &g_ui.showCharts, wflags)) { ImGui::End(); return; }
 
@@ -3478,36 +3497,37 @@ static void UiDrawChartsWindow(const ClimateChartHistory &history, float yearPha
         ImGui::EndCombo();
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("yearly cycle");
+    ImGui::SetNextItemWidth(120);
+    ImGui::SliderFloat("##window", &g_ui.globalHistRollSeconds, 5.0f, 300.0f, "%.0f s window");
+    ImGui::SameLine();
+    ImGui::TextDisabled("rolling");
 
-    float xs[CLIMATE_CHART_BINS];
-    float ys[CLIMATE_CHART_BINS];
-    int n = 0;
-    for (int b = 0; b < CLIMATE_CHART_BINS; b++) {
-        if (history.sampleCounts[b] > 0.0f) {
-            xs[n] = (float)b / (float)CLIMATE_CHART_BINS;
-            ys[n] = WeatherChartDisplayValue(g_ui.chartsMode, history.values[(int)g_ui.chartsMode][b]);
-            n++;
-        }
-    }
+    int count = g_ui.globalHistCount;
+    int mode = (int)g_ui.chartsMode;
 
     if (ImPlot::BeginPlot("##chart", ImVec2(-1, -1),
                           ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
-        ImPlot::SetupAxes("year phase", WeatherChartUnit(g_ui.chartsMode),
-                          ImPlotAxisFlags_None,
-                          ImPlotAxisFlags_AutoFit);
-        ImPlot::SetupAxisLimits(ImAxis_X1, 0.0, 1.0, ImGuiCond_Once);
-        if (n > 1) {
+        ImPlot::SetupAxes("sim time (s)", WeatherChartUnit(g_ui.chartsMode),
+                          ImPlotAxisFlags_NoMenus,
+                          ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_NoMenus);
+        double t1 = (double)g_ui.globalHistSimTime;
+        double t0 = t1 - (double)g_ui.globalHistRollSeconds;
+        ImPlot::SetupAxisLimits(ImAxis_X1, t0, t1, ImGuiCond_Always);
+        if (count > 1) {
+            float xs[UiState::GlobalBins];
+            float ys[UiState::GlobalBins];
+            int start = (g_ui.globalHistHead - count + UiState::GlobalBins) % UiState::GlobalBins;
+            float dt = 1.0f / (float)WEATHER_UPDATE_HZ;     // sample spacing
+            float baseT = g_ui.globalHistSimTime - (float)(count - 1) * dt;
+            for (int i = 0; i < count; i++) {
+                xs[i] = baseT + (float)i * dt;
+                ys[i] = g_ui.globalHistory[mode][(start + i) % UiState::GlobalBins];
+            }
             ImPlotSpec spec;
             spec.LineColor = UiChartColor(g_ui.chartsMode);
             spec.LineWeight = 2.0f;
-            ImPlot::PlotLine(WeatherViewShortName(g_ui.chartsMode), xs, ys, n, spec);
+            ImPlot::PlotLine(WeatherViewShortName(g_ui.chartsMode), xs, ys, count, spec);
         }
-        double cur = yearPhase;
-        ImPlotSpec nowSpec;
-        nowSpec.LineColor = ImVec4(1.0f, 0.78f, 0.32f, 0.70f);
-        nowSpec.LineWeight = 1.5f;
-        ImPlot::PlotInfLines("##now", &cur, 1, nowSpec);
         ImPlot::EndPlot();
     }
     ImGui::End();
@@ -3984,6 +4004,7 @@ int main(void)
                 weatherA = weatherB;
                 weatherB = swap;
                 UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
+                UiPushGlobalSample(climateCharts, weatherStep);
                 if (selectedTile >= 0 && selectedTile < tileCount)
                     UiPushInspectorSample(&weatherA[selectedTile], selectedTile);
                 weatherTimer -= weatherStep;
@@ -4059,7 +4080,7 @@ int main(void)
             UiDrawControlsWindow(climate, atmosphereEnabled, weatherEnabled, tectonicsPaused,
                                  showPlateView, weatherView, resetWeatherRequested, solar);
             UiDrawInspectorWindow(tiles, plates, weatherA, tileCount, selectedTile, weatherView);
-            UiDrawChartsWindow(climateCharts, climate.yearPhase);
+            UiDrawChartsWindow();
             UiDrawLegendWindow(weatherView, weatherEnabled, showPlateView);
             UiDrawOrbitMapWindow(solar, climate, orbit);
         }
