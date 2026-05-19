@@ -3170,10 +3170,12 @@ struct UiState {
     // Global rolling buffer for the climate-charts window
     static const int GlobalBins = 720;
     float globalHistory[WEATHER_VIEW_COUNT][GlobalBins]{};
+    float globalHistYearsAt[GlobalBins]{};  // sample-aligned x values (planet years)
     int globalHistHead = 0;
     int globalHistCount = 0;
-    float globalHistSimTime = 0.0f;     // total elapsed sim time at the most recent sample
-    float globalHistRollSeconds = 30.0f; // visible window width
+    float globalHistYears = 0.0f;        // total elapsed planet years at most-recent sample
+    float globalHistRollYears = 1.0f;    // visible window in planet years
+    bool chartsAutoFitY = true;
 
     // Charts metric
     WeatherViewMode chartsMode = WEATHER_VIEW_TEMPERATURE;
@@ -3257,13 +3259,14 @@ static void UiEnsureOrbitTextureSize(int w, int h)
     SetTextureFilter(g_ui.orbitTex.texture, TEXTURE_FILTER_BILINEAR);
 }
 
-static void UiPushGlobalSample(const ClimateChartHistory &history, float dt)
+static void UiPushGlobalSample(const ClimateChartHistory &history, float yearsDelta)
 {
-    g_ui.globalHistSimTime += dt;
+    g_ui.globalHistYears += yearsDelta;
     int idx = g_ui.globalHistHead;
     for (int m = 0; m < WEATHER_VIEW_COUNT; m++) {
         g_ui.globalHistory[m][idx] = WeatherChartDisplayValue((WeatherViewMode)m, history.latest[m]);
     }
+    g_ui.globalHistYearsAt[idx] = g_ui.globalHistYears;
     g_ui.globalHistHead = (g_ui.globalHistHead + 1) % UiState::GlobalBins;
     if (g_ui.globalHistCount < UiState::GlobalBins) g_ui.globalHistCount++;
 }
@@ -3497,31 +3500,42 @@ static void UiDrawChartsWindow()
         ImGui::EndCombo();
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(120);
-    ImGui::SliderFloat("##window", &g_ui.globalHistRollSeconds, 5.0f, 300.0f, "%.0f s window");
+    ImGui::SetNextItemWidth(150);
+    ImGui::SliderFloat("##window", &g_ui.globalHistRollYears, 0.05f, 8.0f, "%.2f yr window");
     ImGui::SameLine();
-    ImGui::TextDisabled("rolling");
+    ImGui::Checkbox("auto-fit Y", &g_ui.chartsAutoFitY);
 
     int count = g_ui.globalHistCount;
     int mode = (int)g_ui.chartsMode;
 
     if (ImPlot::BeginPlot("##chart", ImVec2(-1, -1),
                           ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText | ImPlotFlags_NoLegend)) {
-        ImPlot::SetupAxes("sim time (s)", WeatherChartUnit(g_ui.chartsMode),
-                          ImPlotAxisFlags_NoMenus,
-                          ImPlotAxisFlags_AutoFit | ImPlotAxisFlags_NoMenus);
-        double t1 = (double)g_ui.globalHistSimTime;
-        double t0 = t1 - (double)g_ui.globalHistRollSeconds;
+        ImPlotAxisFlags yFlags = g_ui.chartsAutoFitY
+            ? ImPlotAxisFlags_AutoFit
+            : ImPlotAxisFlags_None;
+        ImPlot::SetupAxes("planet year", WeatherChartUnit(g_ui.chartsMode),
+                          ImPlotAxisFlags_None,
+                          yFlags);
+        double t1 = (double)g_ui.globalHistYears;
+        double t0 = t1 - (double)g_ui.globalHistRollYears;
         ImPlot::SetupAxisLimits(ImAxis_X1, t0, t1, ImGuiCond_Always);
         if (count > 1) {
             float xs[UiState::GlobalBins];
             float ys[UiState::GlobalBins];
             int start = (g_ui.globalHistHead - count + UiState::GlobalBins) % UiState::GlobalBins;
-            float dt = 1.0f / (float)WEATHER_UPDATE_HZ;     // sample spacing
-            float baseT = g_ui.globalHistSimTime - (float)(count - 1) * dt;
+            float yMin = +1e30f, yMax = -1e30f;
             for (int i = 0; i < count; i++) {
-                xs[i] = baseT + (float)i * dt;
-                ys[i] = g_ui.globalHistory[mode][(start + i) % UiState::GlobalBins];
+                int b = (start + i) % UiState::GlobalBins;
+                xs[i] = g_ui.globalHistYearsAt[b];
+                float v = g_ui.globalHistory[mode][b];
+                ys[i] = v;
+                if (v < yMin) yMin = v;
+                if (v > yMax) yMax = v;
+            }
+            // Seed initial Y range so manual-mode users start with the data in frame.
+            if (!g_ui.chartsAutoFitY && yMax > yMin) {
+                float pad = (yMax - yMin) * 0.12f + 0.5f;
+                ImPlot::SetupAxisLimits(ImAxis_Y1, yMin - pad, yMax + pad, ImGuiCond_Once);
             }
             ImPlotSpec spec;
             spec.LineColor = UiChartColor(g_ui.chartsMode);
@@ -4004,7 +4018,7 @@ int main(void)
                 weatherA = weatherB;
                 weatherB = swap;
                 UpdateClimateChartHistory(&climateCharts, weatherA, tileCount, climate.yearPhase);
-                UiPushGlobalSample(climateCharts, weatherStep);
+                UiPushGlobalSample(climateCharts, weatherStep * 0.0035f * climate.yearSpeed);
                 if (selectedTile >= 0 && selectedTile < tileCount)
                     UiPushInspectorSample(&weatherA[selectedTile], selectedTile);
                 weatherTimer -= weatherStep;
